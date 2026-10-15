@@ -2,6 +2,7 @@
 -- Star Conflict Server Selector Mod
 -- Custom Community Server Manager with Dropdown, Add Server,
 -- Context Menu (Right Click -> Set Default / Delete), and Default Auto-Load
+-- Version 1.1.1: Live auto-update verification test
 -- ============================================================================
 
 -- Visible records in the dropdown before vertical scrollbar activates (fits 720p to 4K cleanly)
