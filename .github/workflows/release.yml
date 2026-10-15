@@ -1,0 +1,48 @@
+name: Build & Release Patcher
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    name: Build Windows Executable & Portable Bundle
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller pillow
+
+      - name: Build standalone executable (PyInstaller)
+        run: |
+          python -m PyInstaller --onefile --noconsole --name StarConflict_Patcher --icon=star_conflict.ico --add-data "star_conflict.ico;." --add-data "server_selector_mod.lua;." --add-data "omega_ui.py;." StarConflict_Patcher.pyw
+
+      - name: Create Portable Zip Package
+        shell: powershell
+        run: |
+          Compress-Archive -Path "StarConflict_Patcher.pyw", "omega_ui.py", "star_conflict.ico", "server_selector_mod.lua", "README.md", "Launch_Patcher.bat" -DestinationPath "dist\StarConflict_Patcher_Portable.zip" -Force
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/StarConflict_Patcher.exe
+            dist/StarConflict_Patcher_Portable.zip
+          generate_release_notes: true
+          draft: false
+          prerelease: false

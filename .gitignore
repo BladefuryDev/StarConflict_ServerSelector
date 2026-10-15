@@ -1,0 +1,24 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# PyInstaller build artifacts
+build/
+dist/
+*.spec
+
+# Release binaries (distributed via GitHub Releases)
+*.exe
+*.zip
+
+# Star Conflict backup & test files
+*.orig
+*.bak
+saved_servers.cfg
+
+# OS and IDE files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
