@@ -19,7 +19,7 @@ import webbrowser
 import tkinter as tk
 from tkinter import filedialog, messagebox
 
-APP_VERSION = "v1.1.1"
+APP_VERSION = "v1.2.0"
 GITHUB_REPO = "BladefuryDev/StarConflict_ServerSelector"
 GITHUB_RELEASES_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 GITHUB_PROJECT_URL = f"https://github.com/{GITHUB_REPO}"
@@ -69,11 +69,23 @@ COMMON_PATHS = [
     r"F:\SteamLibrary\steamapps\common\star conflict",
 ]
 
-EMBEDDED_MOD_LUA = """-- ============================================================================
+EMBEDDED_MOD_LUA = r"""-- ============================================================================
 -- Star Conflict Server Selector Mod
--- Custom Community Server Manager with Dropdown, Add Server,
--- Context Menu (Right Click -> Set Default / Delete), and Default Auto-Load
--- Version 1.1.1: Live auto-update verification test
+-- Server Panel for the login screen, built from the game's own login widgets
+-- Features:
+--   * Server panel drawn like the native drop-down field (black fill + 1px #383C41
+--     hairline), header line in the login screen's own label palette and fonts
+--   * 3 Action Buttons (Add / Save, Set Default, Delete) built on the native
+--     login_simpleBtn effect (idle / over / press / select / disable), scaled to
+--     their slot with effect:SetScale like chatwnd.lua does
+--   * Native Tooltips (EffectButtonWnd:SetTooltipData -> UI.tooltipTypes.TEXT_LARGE)
+--   * Native Color-Coded ComboBox1 Records (data.color)
+--   * Layout authored in the login screen's 1280x720 .sanim space so it scales with
+--     the native controls (720p / 1080p / 1440p / 4K)
+--   * Auto-Hide Underlying Controls When Dropdown List Expands
+--   * Right-Click Context Menu & Profile Persistence (.prfl via GetProfileTable / Profile:Save)
+--     (the game's Lua has no io library, so there is no file-based fallback)
+-- Version 1.3.0
 -- ============================================================================
 
 -- Visible records in the dropdown before vertical scrollbar activates (fits 720p to 4K cleanly)
@@ -82,37 +94,454 @@ if UI.Login_ServersComboBox then
 end
 
 -- ----------------------------------------------------------------------------
--- UI.Login_AddServerBtn Window Definition
+-- Native login screen palette & metrics
+-- Colors are taken from the login .sanim files (login_main, drop_down_input,
+-- drop_down_list, login_univer_btn); metrics are in login_main's base_res space.
 -- ----------------------------------------------------------------------------
-UI.Login_AddServerBtn =
+local SS_STYLE =
 {
-	def =
-	{
-		className	= "ButtonWnd",
-		prototype	= "TextBtn2",
+	LOGIN_RES      = { x = 1280, y = 720 },
 
-		props =
-		{
-			name		= "Login_AddServerBtn",
-		},
-	},
+	COL_LABEL      = 0xFFCCCCCC,	-- login_main "status_server" / "version"
+	COL_LIST_TEXT  = 0xFF88B5FF,	-- drop_down_list "line_N"
+	COL_DIM        = 0xFF878787,	-- drop_down_input "simple_color"
+	COL_GOLD       = 0xFFFFD200,	-- login_univer_btn "color_1"
+	COL_WARNING    = 0xFFFF9100,	-- login_main "warning"
+	COL_WHITE      = 0xFFFFFFFF,
+	COL_PLATE      = 0xE6000000,	-- drop-down field fill (black)
+	COL_BORDER     = 0xFF383C41,	-- drop-down field 1px hairline
+	COL_BORDER_ACT = 0xFF6A93B5,	-- drop_down_input "select_color"
 
-	textId = "",
+	BTN_EFFECT     = "login_simpleBtn",	-- login_univer_btn.sanim (Options / Start Server)
+	HEADER_FONT    = "VerySmall",
+
+	PAD_X          = 8,
+	PAD_TOP        = 4,
+	PAD_BOTTOM     = 8,
+	HEADER_H       = 22,
+	GAP_COMBO      = 8,
+	GAP_BTN        = 6,
+	GAP_ROW        = 8,
+	BTN_ADD_W      = 84,
+	BTN_DEFAULT_W  = 104,
+	BTN_DELETE_W   = 84,
+
+	-- login_univer_btn.sanim is authored 135x24 (aspect ~5.6); a measured size outside
+	-- this band is a not-yet-initialised effect and is ignored until the next frame
+	BTN_ASPECT_MIN = 3,
+	BTN_ASPECT_MAX = 12,
+	-- Hard limits so a bad measurement can never blow a button up over the screen
+	BTN_SCALE_MIN  = 0.25,
+	BTN_SCALE_MAX  = 2.5,
 }
 
-function UI.Login_AddServerBtn:F_PostLoad()
-	if UI.TextBtn and UI.TextBtn.F_PostLoad then
-		UI.TextBtn.F_PostLoad( self )
-	end
-	if self.SetBtnText then
-		self:SetBtnText( "Add Server" )
-	elseif UI.Login_Btn and UI.Login_Btn.layers and self.SetText then
-		self:SetText( "Add Server", UI.Login_Btn.layers.TEXT )
-	end
+-- Layer count of the EffectButtonWnd base (MAIN_EFFECT + DEBUG), same as loginwnd's l_effectBtnNumLayers
+local SS_BTN_BASE_LAYERS = UI:GetTableLength( UI.EffectButtonWnd.layers )
+
+local function SX( v )
+	return UI:XTo1024x768( v, SS_STYLE.LOGIN_RES )
+end
+
+local function SY( v )
+	return UI:YTo1024x768( v, SS_STYLE.LOGIN_RES )
 end
 
 -- ----------------------------------------------------------------------------
--- Context Menu & Slot Hook Lazy Initializers
+-- Safe Font Resolver Helper
+-- Eliminates Lua colon syntax pitfalls; falls back to "Small" if the pattern is unknown
+-- ----------------------------------------------------------------------------
+local function SafeGetFont( fontName )
+	local names = { fontName or "Small", "Small" }
+	for _, name in ipairs( names ) do
+		if UI and UI.GetFontByPatternName then
+			local h = UI:GetFontByPatternName( name )
+			if h and h ~= FONT.INVALID_FONT_HANDLE then
+				return h
+			end
+		end
+		if _G and _G.ObtainFont then
+			local h = _G.ObtainFont( name )
+			if h and h ~= FONT.INVALID_FONT_HANDLE then
+				return h
+			end
+		end
+	end
+	return FONT.INVALID_FONT_HANDLE
+end
+
+local function MeasureTextW( str, hFont )
+	if _G.MeasureText and str and str ~= "" and hFont then
+		local dummyRect = UI:Quat( 0, 0, 10000, 10000 )
+		local res = _G.MeasureText( str, hFont, dummyRect, FONT.TF_SINGLELINE + FONT.TF_NOCLIP, dummyRect )
+		if res and res.z and res.z > 0 then
+			return res.z
+		end
+	end
+	return SX( string.len( str or "" ) * 6 )
+end
+
+-- ----------------------------------------------------------------------------
+-- Action Buttons (Add / Save, Set Default, Delete)
+-- Built on the native Login_Btn layers / login_simpleBtn effect so they share the look, animations
+-- and hover sound of the login screen's Options / Start Server / Forgot buttons.
+-- ----------------------------------------------------------------------------
+
+-- Per-instance effectInfo tables (never mutate the shared Login_Btn table)
+local SS_BTN_ANIMS_NORMAL =
+{
+	main =
+	{
+		animationIdle     = "idle",
+		animationSelect   = "over",
+		animationPressed  = "press",
+		animationDisabled = "disable",
+	},
+}
+
+-- "Toggled" look for an active state (e.g. the selected server is already the default)
+local SS_BTN_ANIMS_TOGGLED =
+{
+	main =
+	{
+		animationIdle     = "select",
+		animationSelect   = "over_select",
+		animationPressed  = "press",
+		animationDisabled = "disable",
+	},
+}
+
+local function CreateServerActionBtnTable( wndName, defaultLabel )
+	-- Same layers as the native Login_Btn, minus its "self" SIZE link: that link makes
+	-- the window adopt the effect's authored 135x24 size, so the buttons could not be
+	-- sized to fit beside the dropdown. FitEffectToSize scales the effect instead.
+	local t =
+	{
+		def =
+		{
+			className = "ButtonWnd",
+			prototype = "EffectButtonWnd",
+
+			props =
+			{
+				name        = wndName,
+				selectSound = UI.LoginWnd.sounds and UI.LoginWnd.sounds.btnMouseOver or "",
+				clickSound  = "",	-- actions play their own confirm / cancel sounds
+			},
+
+			layers =
+			{
+				numLayers = SS_BTN_BASE_LAYERS + 1,
+
+				-- MAIN_EFFECT
+				{
+					layerType  = UI.LAYER_EFFECT,
+					layerStyle = UI.WLS_RESIZABLE,
+					main       = true,
+
+					effects =
+					{{
+						defName          = SS_STYLE.BTN_EFFECT,
+						defaultAnimation = "idle",
+
+						links =
+						{
+							{
+								objName    = "value",
+								layer      = "UI." .. wndName .. ".layers.TEXT",
+								animParams = UI.EffectAnimParams.SIZE + UI.EffectAnimParams.POS + UI.EffectAnimParams.ALIGNMENT + UI.EffectAnimParams.COLOR + UI.EffectAnimParams.ALPHA + UI.EffectAnimParams.FONT + UI.EffectAnimParams.BLEND,
+							},
+						}
+					}}
+				},
+
+				-- TEXT
+				{
+					id = SS_BTN_BASE_LAYERS,
+
+					layerType    = UI.LAYER_TEXT,
+					formatInfoSz = { 1, 1 },
+					formatFlags  = FONT.TF_NOCLIP + FONT.TF_SINGLELINE,
+					font         = { fontName = "Small" },
+				},
+			},
+		},
+
+		layers =
+		{
+			MAIN_EFFECT = 0,
+			DEBUG       = 1,
+			TEXT        = SS_BTN_BASE_LAYERS,
+		},
+
+		effectInfo       = SS_BTN_ANIMS_NORMAL,
+		buttonText       = defaultLabel,
+		baseSize         = nil,
+		isActionDisabled = false,
+		isToggled        = false,
+	}
+
+	function t:F_PostLoad()
+		if UI.EffectButtonWnd and UI.EffectButtonWnd.F_PostLoad then
+			UI.EffectButtonWnd.F_PostLoad( self )
+		end
+		-- Do not measure the effect here: right after creation it can still report a
+		-- placeholder size, which made the buttons scale up to cover the login screen.
+		self.baseSize = nil
+		self:SetBtnText( self.buttonText or defaultLabel )
+	end
+
+	-- Measures the effect's authored size, accepting only a button-shaped answer.
+	-- Must return a fresh table { x, y }, NOT UI:Vec2(...): UI:Vec2 hands out one of
+	-- 20 ring-buffered scratch userdata in UI.tempBufs.bufV2, which wraps around after
+	-- 20 calls anywhere in the UI and overwrites stored references in place.
+	function t:MeasureEffectBase( effect )
+		local size = effect:GetObjSize( "self" )
+		if not size or not size.x or not size.y or size.x <= 0 or size.y <= 0 then
+			return nil
+		end
+		-- Rel units are anisotropic and the engine's .sanim unit conversion is not
+		-- documented, so accept the size if either its pixel or its Rel aspect looks
+		-- like the authored button; a square placeholder fails both
+		local pxW = size.x * UI.rel2Abs_x
+		local pxH = size.y * UI.rel2Abs_y
+		local function IsButtonAspect( a )
+			return a >= SS_STYLE.BTN_ASPECT_MIN and a <= SS_STYLE.BTN_ASPECT_MAX
+		end
+		if pxH < 8 or not ( IsButtonAspect( pxW / pxH ) or IsButtonAspect( size.x / size.y ) ) then
+			return nil
+		end
+		return { x = size.x, y = size.y }
+	end
+
+	-- Stretches the native effect to the window. Safe to call every frame: it
+	-- re-measures until the effect reports a sane size, clamps the scale, and only
+	-- touches the effect when the scale actually differs.
+	function t:UpdateEffectScale()
+		local effect = UI:GetEffectFromLayer( self, self.layers.MAIN_EFFECT )
+		if not effect then
+			return
+		end
+		if not self.baseSize then
+			self.baseSize = self:MeasureEffectBase( effect )
+			if not self.baseSize then
+				return
+			end
+		end
+
+		local function Clamp( v )
+			return math.max( SS_STYLE.BTN_SCALE_MIN, math.min( SS_STYLE.BTN_SCALE_MAX, v ) )
+		end
+		local sx = Clamp( self:GetWidth() / self.baseSize.x )
+		local sy = Clamp( self:GetHeight() / self.baseSize.y )
+
+		local cur = effect:GetScale()
+		if not cur or math.abs( cur.x - sx ) > 0.001 or math.abs( cur.y - sy ) > 0.001 then
+			effect:SetScale( UI:Vec2( sx, sy ) )
+		end
+	end
+
+	function t:F_Draw( x0, y0, width, height, clipX0, clipY0, clipWidth, clipHeight )
+		pcall( self.UpdateEffectScale, self )
+		self:Draw( UI:Quat( x0, y0, width, height ), UI:Quat( clipX0, clipY0, clipWidth, clipHeight ) )
+	end
+
+	-- Sets the window rect; the effect follows via UpdateEffectScale
+	function t:SetFrameRect( left, top, width, height )
+		self:SetLeft( left )
+		self:SetTop( top )
+		self:SetWidth( width )
+		self:SetHeight( height )
+		self:UpdateEffectScale()
+	end
+
+	function t:SetBtnText( str )
+		self.buttonText = str or ""
+		if self.w and self.SetText and self.layers and self.layers.TEXT then
+			self:SetText( self.buttonText, self.layers.TEXT )
+		end
+	end
+
+	-- Applies label, enabled/toggled state and tooltip in one go.
+	-- Disabled buttons use WS_GRAYED (not WS_DISABLE) so they stay hoverable
+	-- and can still explain themselves through the tooltip.
+	function t:ApplyActionState( label, bDisabled, bToggled, caption, tooltip )
+		self:SetBtnText( label )
+
+		self.isActionDisabled = bDisabled and true or false
+		self.isToggled        = (bToggled and not bDisabled) and true or false
+		self.effectInfo       = self.isToggled and SS_BTN_ANIMS_TOGGLED or SS_BTN_ANIMS_NORMAL
+
+		if self.w then
+			if self.isActionDisabled then
+				self:AddStyle( UI.WS_GRAYED )
+			else
+				self:RemoveStyle( UI.WS_GRAYED )
+			end
+			if self.UpdateEffectAnimation then
+				self:UpdateEffectAnimation()
+			end
+		end
+
+		if UI.tooltipTypes and UI.tooltipTypes.TEXT_LARGE and tooltip and tooltip ~= "" then
+			self.tooltipData =
+			{
+				tooltipType = UI.tooltipTypes.TEXT_LARGE,	-- field name used by the game's tooltip code
+				caption   = caption or "Server Selector",
+				text      = tooltip,
+			}
+		else
+			self.tooltipData = nil
+		end
+	end
+
+	return t
+end
+
+UI.Login_AddServerBtn     = CreateServerActionBtnTable( "Login_AddServerBtn",     "Add" )
+UI.Login_DefaultServerBtn = CreateServerActionBtnTable( "Login_DefaultServerBtn", "Set Default" )
+UI.Login_DeleteServerBtn  = CreateServerActionBtnTable( "Login_DeleteServerBtn",  "Delete" )
+
+-- ----------------------------------------------------------------------------
+-- Server Panel (UI.Login_ServerDockWnd)
+-- Drawn like the native drop-down field: black fill + 1px #383C41 hairline
+-- (Targem's own DrawFocusFrame pattern from effecttreepreviewwnd.lua), so the
+-- border stays 1 physical pixel at any panel size and resolution.
+-- Header: "Server | <status> | N saved" in the login label palette
+-- ----------------------------------------------------------------------------
+UI.Login_ServerDockWnd =
+{
+	def =
+	{
+		className = "Wnd",
+		props =
+		{
+			name  = "Login_ServerDockWnd",
+			style = UI.WS_NOT_MOUSE_REACT + UI.WS_NOT_KB_REACT,
+		},
+		layers =
+		{
+			-- 0: Field fill
+			{
+				layerType  = UI.LAYER_TEXTURE,
+				layerStyle = UI.WLS_RESIZABLE,
+				texture    = "white",
+				color      = SS_STYLE.COL_PLATE,
+			},
+			-- 1: Owner-drawn hairline border + header line
+			{
+				layerType    = UI.LAYER_TEXT,
+				layerStyle   = UI.WLS_OWNERDRAW + UI.WLS_RESIZABLE,
+				font         = { fontName = SS_STYLE.HEADER_FONT },
+				formatFlags  = FONT.TF_LEFT + FONT.TF_VCENTER + FONT.TF_SINGLELINE + FONT.TF_NOCLIP,
+				formatInfoSz = { 1, 1 },
+				color        = SS_STYLE.COL_LABEL,
+			},
+		},
+	},
+	layers =
+	{
+		PLATE   = 0,
+		OVERLAY = 1,
+	},
+	headerTitle  = "Server",
+	statusText   = "Localhost",
+	statusColor  = SS_STYLE.COL_LABEL,
+	countText    = "",
+	isCustomOpen = false,
+}
+
+function UI.Login_ServerDockWnd:UpdateHeaderTelemetry( selServer, isDefault, savedCount, bShowServerFields )
+	-- Border lights up in the native selection blue while the custom endpoint fields are open
+	self.isCustomOpen = bShowServerFields and true or false
+
+	if bShowServerFields or (selServer and selServer.isCustom) then
+		self.statusText  = "Custom"
+		self.statusColor = SS_STYLE.COL_WARNING
+	elseif isDefault then
+		self.statusText  = "Default"
+		self.statusColor = SS_STYLE.COL_GOLD
+	elseif selServer and selServer.isSaved then
+		self.statusText  = "Saved"
+		self.statusColor = SS_STYLE.COL_LIST_TEXT
+	else
+		self.statusText  = "Localhost"
+		self.statusColor = SS_STYLE.COL_LABEL
+	end
+
+	self.countText = string.format( "%d saved", savedCount or 0 )
+end
+
+function UI.Login_ServerDockWnd:F_DrawLayer( x0, y0, width, height, clipX0, clipY0, clipW, clipH, layerIdx )
+	if layerIdx ~= self.layers.OVERLAY then
+		return
+	end
+
+	pcall(function()
+		local layerAlpha = ( UI.GetAlpha and UI:GetAlpha( self:GetColor( self.layers.OVERLAY ) ) or 255 ) / 255
+		if layerAlpha <= 0 then
+			return
+		end
+		local function ApplyAlpha( c )
+			if layerAlpha >= 0.999 or not UI.GetAlpha or not UI.SetAlpha then
+				return c
+			end
+			return UI:SetAlpha( c, math.floor( UI:GetAlpha( c ) * layerAlpha + 0.5 ) )
+		end
+
+		-- 1. 1px hairline border
+		local hTex = UI:GetTex( "white" )
+		if UI.drawer and UI.drawer.DrawImagedRect and hTex and hTex ~= UI.INVALID_RESOURCE_HANDLE then
+			local px  = UI:XToRel( 1 )
+			local py  = UI:YToRel( 1 )
+			local col = ApplyAlpha( self.isCustomOpen and SS_STYLE.COL_BORDER_ACT or SS_STYLE.COL_BORDER )
+
+			UI.drawer:DrawImagedRect( x0, y0, width, py, clipX0, clipY0, clipW, clipH, hTex, col, 0, 0, 1, 1, false )
+			UI.drawer:DrawImagedRect( x0, y0 + height - py, width, py, clipX0, clipY0, clipW, clipH, hTex, col, 0, 0, 1, 1, false )
+			UI.drawer:DrawImagedRect( x0, y0 + py, px, height - py * 2, clipX0, clipY0, clipW, clipH, hTex, col, 0, 0, 1, 1, false )
+			UI.drawer:DrawImagedRect( x0 + width - px, y0 + py, px, height - py * 2, clipX0, clipY0, clipW, clipH, hTex, col, 0, 0, 1, 1, false )
+		end
+
+		-- 2. Header line
+		if not _G.UI_DrawText then
+			return
+		end
+		local hFont = SafeGetFont( SS_STYLE.HEADER_FONT )
+		if not hFont or hFont == FONT.INVALID_FONT_HANDLE then
+			return
+		end
+
+		local flags = FONT.TF_LEFT + FONT.TF_VCENTER + FONT.TF_SINGLELINE + FONT.TF_NOCLIP
+		local lineY = y0 + SY( SS_STYLE.PAD_TOP )
+		local lineH = SY( SS_STYLE.HEADER_H - SS_STYLE.PAD_TOP * 2 )
+		local gapX  = SX( 6 )
+		local x     = x0 + SX( SS_STYLE.PAD_X )
+
+		local parts =
+		{
+			{ self.headerTitle or "Server", SS_STYLE.COL_LABEL },
+			{ "|",                          SS_STYLE.COL_DIM },
+			{ self.statusText or "",        self.statusColor or SS_STYLE.COL_LABEL },
+		}
+		if self.countText and self.countText ~= "" then
+			table.insert( parts, { "|",            SS_STYLE.COL_DIM } )
+			table.insert( parts, { self.countText, SS_STYLE.COL_DIM } )
+		end
+
+		UI.drawer:EndUiDrawing()
+		for _, part in ipairs( parts ) do
+			local str = part[1]
+			if str ~= "" then
+				local w = MeasureTextW( str, hFont )
+				_G.UI_DrawText( str, hFont, UI:Quat( x, lineY, w, lineH ), ApplyAlpha( part[2] ), 0, flags, UI:Quat( clipX0, clipY0, clipW, clipH ) )
+				x = x + w + gapX
+			end
+		end
+		UI.drawer:BeginUiDrawing()
+	end)
+end
+
+-- ----------------------------------------------------------------------------
+-- Context Menu, Slot & Dropdown State Hook Lazy Initializers
 -- ----------------------------------------------------------------------------
 local l_cmHooksInstalled = false
 function UI.LoginWnd:EnsureContextMenuHooks()
@@ -133,7 +562,7 @@ function UI.LoginWnd:EnsureContextMenuHooks()
 				else
 					if mainEffect then mainEffect:StartAnimation( "idle" ) end
 				end
-				self.metaText:InitFromLayer( self, self.layers.TEXT ) 
+				self.metaText:InitFromLayer( self, self.layers.TEXT )
 				self.metaTextPos = mainEffect and mainEffect:GetObjPos( metaTextLocator )
 				self.metaText:SetText( text, true )
 				self:UpdateEffects()
@@ -199,86 +628,288 @@ function UI.LoginWnd:EnsureSlotHooks()
 	end
 end
 
--- ----------------------------------------------------------------------------
--- Add Server Button Management
--- ----------------------------------------------------------------------------
+local l_comboStateHookInstalled = false
+function UI.LoginWnd:EnsureComboStateHook()
+	if l_comboStateHookInstalled or not UI.Login_ServersComboBox then
+		return
+	end
 
-function UI.LoginWnd:EnsureAddServerBtn()
+	local orig_SetState = UI.Login_ServersComboBox.SetState
+	if orig_SetState then
+		UI.Login_ServersComboBox.SetState = function( comboSelf, state, bForce )
+			orig_SetState( comboSelf, state, bForce )
+			if UI.LoginWnd and UI.LoginWnd.SyncDropdownOverlapVisibility then
+				UI.LoginWnd:SyncDropdownOverlapVisibility()
+			end
+		end
+		l_comboStateHookInstalled = true
+	end
+end
+
+-- Hides underlying edit boxes & patch label while the combobox list popup is open
+function UI.LoginWnd:SyncDropdownOverlapVisibility()
 	pcall(function()
-		if not UI.Login_AddServerBtn or not UI.Login_AddServerBtn.IsChildOf then
-			if UI.CreateWndFromTable then
-				local btn = UI:CreateWndFromTable( "UI.Login_AddServerBtn" )
-				if btn then
-					UI.Login_AddServerBtn = btn
-				end
+		if not UI.Login_ServersComboBox or not UI.Login_ServersComboBox.IsOpen then
+			return
+		end
+		local bOpen = UI.Login_ServersComboBox:IsOpen()
+		local hideFlags = UI.WS_NOT_DRAW + UI.WS_NOT_MOUSE_REACT
+
+		if UI.Login_ServerNameEditWnd and UI.Login_ServerNameEditWnd.w then
+			if bOpen then
+				UI.Login_ServerNameEditWnd:AddStyle( hideFlags )
+			else
+				UI.Login_ServerNameEditWnd:RemoveStyle( hideFlags )
 			end
 		end
 
-		if UI.Login_AddServerBtn and UI.Login_AddServerBtn.IsChildOf then
-			if not UI.Login_AddServerBtn:IsChildOf( self ) then
-				self:AddChild( UI.Login_AddServerBtn )
+		if UI.Login_ServerPortEditWnd and UI.Login_ServerPortEditWnd.w then
+			if bOpen then
+				UI.Login_ServerPortEditWnd:AddStyle( hideFlags )
+			else
+				UI.Login_ServerPortEditWnd:RemoveStyle( hideFlags )
 			end
-			if UI.Login_AddServerBtn.SetBtnText then
-				UI.Login_AddServerBtn:SetBtnText( "Add Server" )
-			elseif UI.Login_Btn and UI.Login_Btn.layers and UI.Login_AddServerBtn.SetText then
-				UI.Login_AddServerBtn:SetText( "Add Server", UI.Login_Btn.layers.TEXT )
-			end
-			self:UpdateAddServerBtnPos()
+		end
+
+		if self.SetLayerVisible and self.layers and self.layers.PATCH_NAME then
+			self:SetLayerVisible( not bOpen, self.layers.PATCH_NAME )
 		end
 	end)
 end
 
-function UI.LoginWnd:UpdateAddServerBtnPos()
+-- ----------------------------------------------------------------------------
+-- Server Dock & Action Buttons Instantiation + Resolution-Adaptive Layout
+-- ----------------------------------------------------------------------------
+function UI.LoginWnd:EnsureServerDockControls()
 	pcall(function()
-		if not UI.Login_AddServerBtn or not UI.Login_AddServerBtn.IsChildOf or not UI.Login_AddServerBtn:IsChildOf( self ) then
+		local function EnsureSingleWnd( tableKey )
+			local wnd = UI[ tableKey ]
+			if not wnd or not wnd.w or not wnd.IsChildOf then
+				if UI.CreateWndFromTable then
+					local created = UI:CreateWndFromTable( "UI." .. tableKey )
+					if created then
+						UI[ tableKey ] = created
+						wnd = created
+					end
+				end
+			end
+			if wnd and wnd.IsChildOf and not wnd:IsChildOf( self ) then
+				self:AddChild( wnd )
+			end
+			return wnd
+		end
+
+		EnsureSingleWnd( "Login_ServerDockWnd" )
+		EnsureSingleWnd( "Login_AddServerBtn" )
+		EnsureSingleWnd( "Login_DefaultServerBtn" )
+		EnsureSingleWnd( "Login_DeleteServerBtn" )
+
+		self:UpdateServerDockLayout()
+	end)
+end
+
+-- Keep backward-compatible alias in case external hooks call EnsureAddServerBtn / UpdateAddServerBtnPos
+function UI.LoginWnd:EnsureAddServerBtn()
+	self:EnsureServerDockControls()
+end
+
+function UI.LoginWnd:UpdateAddServerBtnPos()
+	self:UpdateServerDockLayout()
+end
+
+function UI.LoginWnd:UpdateServerDockLayout()
+	pcall(function()
+		if not self:NeedServersComboBox() then
 			return
 		end
 
+		if not UI.Login_AddServerBtn or not UI.Login_AddServerBtn.w or not UI.Login_AddServerBtn:IsChildOf( self ) then
+			return
+		end
+
+		local function IsLinked( t )
+			return t and t.w and t.IsChildOf and t:IsChildOf( self )
+		end
+
+		-- 1. Query exact combobox origin & closed bar dimensions via stateBtn
 		local comboLeft = UI.Login_ServersComboBox and UI.Login_ServersComboBox.GetLeft and UI.Login_ServersComboBox:GetLeft()
-		local comboTop = UI.Login_ServersComboBox and UI.Login_ServersComboBox.GetTop and UI.Login_ServersComboBox:GetTop()
-		local comboWidth = UI.Login_ServersComboBox and UI.Login_ServersComboBox.GetWidth and UI.Login_ServersComboBox:GetWidth()
-		local comboHeight = UI.Login_ServersComboBox and UI.Login_ServersComboBox.GetHeight and UI.Login_ServersComboBox:GetHeight()
+		local comboTop  = UI.Login_ServersComboBox and UI.Login_ServersComboBox.GetTop and UI.Login_ServersComboBox:GetTop()
 
+		-- Fallback: drop_down_main locator in login_main.sanim
 		if not comboLeft or comboLeft <= 0 then
-			if UI.Login_ServerNameEditWnd and UI.Login_ServerNameEditWnd.GetLeft then
-				local snLeft = UI.Login_ServerNameEditWnd:GetLeft()
-				if snLeft and snLeft > 0 then
-					comboLeft = snLeft
-				end
-			end
-			if not comboLeft or comboLeft <= 0 then
-				comboLeft = 14
-			end
+			comboLeft = SX( 14 )
 		end
-
 		if not comboTop or comboTop <= 0 then
-			if UI.Login_ServerNameEditWnd and UI.Login_ServerNameEditWnd.GetTop then
-				local snTop = UI.Login_ServerNameEditWnd:GetTop()
-				if snTop and snTop > 30 then
-					comboTop = snTop - 30
+			comboTop = SY( 587 )
+		end
+
+		local stateBtn  = UI.Login_ServersComboBox and UI.Login_ServersComboBox.stateBtn
+		local barWidth  = stateBtn and stateBtn.GetWidth and stateBtn:GetWidth()
+		local barHeight = stateBtn and stateBtn.GetHeight and stateBtn:GetHeight()
+
+		-- Fallback: drop_down_input is 258x25 in login space
+		if not barWidth or barWidth < 50 or barWidth > 400 then
+			barWidth = SX( 258 )
+		end
+		if not barHeight or barHeight < 10 or barHeight > 60 then
+			barHeight = SY( 25 )
+		end
+
+		-- 2. Action buttons on the dropdown row, same height as the dropdown bar
+		local buttons =
+		{
+			{ UI.Login_AddServerBtn,     SX( SS_STYLE.BTN_ADD_W ) },
+			{ UI.Login_DefaultServerBtn, SX( SS_STYLE.BTN_DEFAULT_W ) },
+			{ UI.Login_DeleteServerBtn,  SX( SS_STYLE.BTN_DELETE_W ) },
+		}
+
+		local btnLeft   = comboLeft + barWidth + SX( SS_STYLE.GAP_COMBO )
+		local rightEdge = comboLeft + barWidth
+		for _, entry in ipairs( buttons ) do
+			local btn, btnWidth = entry[1], entry[2]
+			if IsLinked( btn ) then
+				btn:SetFrameRect( btnLeft, comboTop, btnWidth, barHeight )
+				rightEdge = btnLeft + btnWidth
+				btnLeft   = rightEdge + SX( SS_STYLE.GAP_BTN )
+			end
+		end
+
+		-- 3. Custom endpoint row (host + port) under the dropdown
+		local rowBottom = comboTop + barHeight
+
+		if IsLinked( UI.Login_ServerNameEditWnd ) then
+			local snLeft   = comboLeft
+			local snTop    = comboTop + barHeight + SY( SS_STYLE.GAP_ROW )
+			local snWidth  = UI.Login_ServerNameEditWnd:GetWidth()
+			local snHeight = UI.Login_ServerNameEditWnd:GetHeight()
+
+			if not snWidth or snWidth <= 20 then
+				snWidth = barWidth
+			end
+			if not snHeight or snHeight <= 8 then
+				snHeight = barHeight
+			end
+
+			UI.Login_ServerNameEditWnd:SetLeft( snLeft )
+			UI.Login_ServerNameEditWnd:SetTop( snTop )
+
+			if IsLinked( UI.Login_ServerPortEditWnd ) then
+				local spLeft = math.max( comboLeft + barWidth + SX( SS_STYLE.GAP_COMBO ), snLeft + snWidth + SX( SS_STYLE.GAP_COMBO ) )
+				UI.Login_ServerPortEditWnd:SetLeft( spLeft )
+				UI.Login_ServerPortEditWnd:SetTop( snTop )
+				rightEdge = math.max( rightEdge, spLeft + (UI.Login_ServerPortEditWnd:GetWidth() or 0) )
+			end
+
+			rowBottom = snTop + snHeight
+		end
+
+		-- 4. Size the server panel around header + controls
+		if IsLinked( UI.Login_ServerDockWnd ) then
+			local dockLeft   = math.max( SX( 2 ), comboLeft - SX( SS_STYLE.PAD_X ) )
+			local dockTop    = math.max( SY( 2 ), comboTop - SY( SS_STYLE.HEADER_H ) )
+			local dockWidth  = (rightEdge + SX( SS_STYLE.PAD_X )) - dockLeft
+			local dockHeight = (rowBottom + SY( SS_STYLE.PAD_BOTTOM )) - dockTop
+
+			UI.Login_ServerDockWnd:SetLeft( dockLeft )
+			UI.Login_ServerDockWnd:SetTop( dockTop )
+			UI.Login_ServerDockWnd:SetWidth( dockWidth )
+			UI.Login_ServerDockWnd:SetHeight( dockHeight )
+
+			-- Keep the panel strictly behind all controls (first position in child list)
+			-- and chain the controls in front of it: Panel -> ComboBox -> Buttons -> Edit fields
+			self:MoveChildToFirstPosition( UI.Login_ServerDockWnd )
+			local prevWnd = UI.Login_ServerDockWnd
+			local chain =
+			{
+				UI.Login_ServersComboBox,
+				UI.Login_AddServerBtn,
+				UI.Login_DefaultServerBtn,
+				UI.Login_DeleteServerBtn,
+				UI.Login_ServerNameEditWnd,
+				UI.Login_ServerPortEditWnd,
+			}
+			for _, wnd in ipairs( chain ) do
+				if IsLinked( wnd ) then
+					self:MoveChildAfter( wnd, prevWnd )
+					prevWnd = wnd
 				end
 			end
-			if not comboTop or comboTop <= 0 then
-				comboTop = 587
-			end
 		end
 
-		-- In 1280x720 base coordinates, the dropdown arrow ends at X ~ 135 (width ~128).
-		-- If comboWidth reported larger than 140, use the actual field width 128.
-		if not comboWidth or comboWidth < 50 or comboWidth > 140 then
-			comboWidth = 128
-		end
-		if not comboHeight or comboHeight < 16 or comboHeight > 40 then
-			comboHeight = 22
-		end
-
-		UI.Login_AddServerBtn:SetLeft( comboLeft + comboWidth + 8 )
-		UI.Login_AddServerBtn:SetTop( comboTop )
-		UI.Login_AddServerBtn:SetWidth( 90 )
-		UI.Login_AddServerBtn:SetHeight( comboHeight )
+		-- 5. Sync button labels, states, tooltips, and panel header
+		self:SyncServerActionStates()
+		self:SyncDropdownOverlapVisibility()
 
 		if self.UpdateZOrder then
 			self:UpdateZOrder()
+		end
+	end)
+end
+
+function UI.LoginWnd:SyncServerActionStates()
+	pcall(function()
+		local selRecordIdx = UI.Login_ServersComboBox and UI.Login_ServersComboBox.GetSelectedRecord and UI.Login_ServersComboBox:GetSelectedRecord() or 1
+		local selServer = self.servers and self.servers[ selRecordIdx ]
+		local bShowServerFields = self:NeedServersComboBox() and selServer and (selServer.isCustom or selServer.name == "server")
+
+		local defAddr = self.defaultServerAddress
+		local isCurrentDefault = false
+		if selServer then
+			if selServer.isLocalhost then
+				isCurrentDefault = (defAddr == "localhost" or defAddr == nil or defAddr == "")
+			elseif selServer.isSaved then
+				isCurrentDefault = (defAddr ~= nil and string.lower( defAddr ) == string.lower( selServer.fullAddress or "" ))
+			end
+		end
+
+		-- 1. Add / Save
+		if UI.Login_AddServerBtn and UI.Login_AddServerBtn.ApplyActionState then
+			if bShowServerFields then
+				UI.Login_AddServerBtn:ApplyActionState( "Save", false, false,
+					"Save Community Server",
+					"Save the entered Host/IP and Port to your persistent server list and select it immediately." )
+			else
+				UI.Login_AddServerBtn:ApplyActionState( "Add", false, false,
+					"Add New Server",
+					"Open the custom server fields to enter and save a new community server IP:Port." )
+			end
+		end
+
+		-- 2. Set Default / Default
+		if UI.Login_DefaultServerBtn and UI.Login_DefaultServerBtn.ApplyActionState then
+			if bShowServerFields then
+				UI.Login_DefaultServerBtn:ApplyActionState( "Set Default", true, false,
+					"Set Default Server",
+					"Save this custom server first to mark it as your auto-selected default server." )
+			elseif isCurrentDefault then
+				UI.Login_DefaultServerBtn:ApplyActionState( "Default", false, true,
+					"Active Default Server",
+					"This server is your default and is selected automatically when the game starts." )
+			else
+				UI.Login_DefaultServerBtn:ApplyActionState( "Set Default", false, false,
+					"Set as Default Server",
+					"Make the selected server your default on game startup." )
+			end
+		end
+
+		-- 3. Delete
+		if UI.Login_DeleteServerBtn and UI.Login_DeleteServerBtn.ApplyActionState then
+			local canDelete = selServer and selServer.isSaved and true or false
+			if canDelete then
+				UI.Login_DeleteServerBtn:ApplyActionState( "Delete", false, false,
+					"Delete Saved Server",
+					string.format( "Remove %s from your saved server list.", tostring( selServer.fullAddress or "" ) ) )
+			else
+				UI.Login_DeleteServerBtn:ApplyActionState( "Delete", true, false,
+					"Delete Saved Server",
+					"Select a saved server in the dropdown to remove it (built-in entries cannot be deleted)." )
+			end
+		end
+
+		-- 4. Panel header
+		if UI.Login_ServerDockWnd and UI.Login_ServerDockWnd.UpdateHeaderTelemetry then
+			local savedCount = self.savedServers and #self.savedServers or 0
+			UI.Login_ServerDockWnd:UpdateHeaderTelemetry( selServer, isCurrentDefault, savedCount, bShowServerFields )
 		end
 	end)
 end
@@ -309,38 +940,6 @@ function UI.LoginWnd:LoadSavedServersData()
 			self.defaultServerAddress = profile.sc_default_server
 		end
 	end
-
-	-- Fallback file read if io is available
-	if #self.savedServers == 0 and io and io.open then
-		pcall(function()
-			local f = io.open( "saved_servers.cfg", "r" )
-			if f then
-				for line in f:lines() do
-					local defVal = string.match( line, "^default=(.*)$" )
-					if defVal and defVal ~= "" then
-						self.defaultServerAddress = defVal
-					end
-					local srvVal = string.match( line, "^server=(.*)$" )
-					if srvVal and srvVal ~= "" then
-						local addr = srvVal
-						local prt = self.DEFAULT_SERVER_PORT
-						local cPos = string.find( srvVal, ":" )
-						if cPos then
-							addr = string.sub( srvVal, 1, cPos - 1 )
-							prt = string.sub( srvVal, cPos + 1 )
-						end
-						local full = string.format( "%s:%s", addr, prt )
-						table.insert( self.savedServers, {
-							address     = addr,
-							port        = prt,
-							fullAddress = full,
-						})
-					end
-				end
-				f:close()
-			end
-		end)
-	end
 end
 
 function UI.LoginWnd:SaveSavedServersData()
@@ -359,20 +958,6 @@ function UI.LoginWnd:SaveSavedServersData()
 		if Profile and Profile.Save then
 			Profile:Save()
 		end
-	end
-
-	-- Fallback file write if io is available
-	if io and io.open then
-		pcall(function()
-			local f = io.open( "saved_servers.cfg", "w" )
-			if f then
-				f:write( "default=" .. tostring( self.defaultServerAddress or "" ) .. "\\n" )
-				for _, s in ipairs( self.savedServers or {} ) do
-					f:write( "server=" .. tostring( s.address ) .. ":" .. tostring( s.port or "3801" ) .. "\\n" )
-				end
-				f:close()
-			end
-		end)
 	end
 end
 
@@ -399,7 +984,7 @@ function UI.LoginWnd:BuildServersList()
 
 	-- 2. Saved Servers
 	for _, s in ipairs( self.savedServers ) do
-		local isDef = (self.defaultServerAddress == s.fullAddress)
+		local isDef = (self.defaultServerAddress ~= nil and string.lower( self.defaultServerAddress ) == string.lower( s.fullAddress ))
 		local disp = isDef and string.format( "%s [Default]", s.fullAddress ) or s.fullAddress
 		table.insert( servers, {
 			name        = s.fullAddress,
@@ -427,7 +1012,7 @@ function UI.LoginWnd:BuildServersList()
 end
 
 -- ----------------------------------------------------------------------------
--- Server Actions
+-- Server Actions (+ ADD / SAVE, SET DEF, DEL)
 -- ----------------------------------------------------------------------------
 function UI.LoginWnd:AddSavedServer( address, port )
 	port = (port and port ~= "") and port or self.DEFAULT_SERVER_PORT
@@ -478,7 +1063,8 @@ function UI.LoginWnd:SetDefaultServer( fullAddress )
 	-- Re-select the default server
 	for idx = 1, #self.servers do
 		local s = self.servers[ idx ]
-		if s.fullAddress == fullAddress or (s.isLocalhost and fullAddress == "localhost") then
+		if (s.fullAddress and string.lower( s.fullAddress ) == string.lower( fullAddress ))
+			or (s.isLocalhost and fullAddress == "localhost") then
 			UI.Login_ServersComboBox:SelectRecord( idx )
 			self:UpdateConfigAddressFromComboBox()
 			self:UpdateServerAddressWnd()
@@ -529,10 +1115,11 @@ end
 function UI.LoginWnd:OnAddServer()
 	local isFieldsVisible = UI.Login_ServerNameEditWnd:IsChildOf( self )
 
-	-- If fields are not visible (e.g. on localhost), open custom server fields and focus
+	-- If fields are not visible (e.g. on localhost or saved server), open custom server drawer & focus
 	if not isFieldsVisible then
 		self:SelectCustomServerEntry()
 		UI:SetKeyboardFocus( UI.Login_ServerNameEditWnd:GetUiHandle() )
+		UI:PlayGlobalSound( self.sounds.btnClick )
 		return
 	end
 
@@ -577,19 +1164,47 @@ function UI.LoginWnd:OnAddServer()
 	UI:PlayGlobalSound( self.sounds.btnClick )
 end
 
+function UI.LoginWnd:OnSetDefaultCurrentServer()
+	local selRecordIdx = UI.Login_ServersComboBox and UI.Login_ServersComboBox:GetSelectedRecord() or -1
+	local selServer = self.servers and self.servers[ selRecordIdx ]
+	if not selServer or selServer.isCustom or selServer.name == "server" then
+		return
+	end
+	local targetAddr = selServer.isLocalhost and "localhost" or selServer.fullAddress
+	if targetAddr and targetAddr ~= "" then
+		self:SetDefaultServer( targetAddr )
+	end
+end
+
+function UI.LoginWnd:OnDeleteCurrentServer()
+	local selRecordIdx = UI.Login_ServersComboBox and UI.Login_ServersComboBox:GetSelectedRecord() or -1
+	local selServer = self.servers and self.servers[ selRecordIdx ]
+	if not selServer or not selServer.isSaved or not selServer.fullAddress then
+		return
+	end
+	self:DeleteSavedServer( selServer.fullAddress )
+end
+
 -- ----------------------------------------------------------------------------
--- UpdateServersComboBox Override
+-- UpdateServersComboBox Override (With Native Record Color-Coding)
 -- ----------------------------------------------------------------------------
 function UI.LoginWnd:UpdateServersComboBox()
 
 	self:EnsureSlotHooks()
 	self:EnsureContextMenuHooks()
+	self:EnsureComboStateHook()
 
 	if not self:NeedServersComboBox() then
 		UI.Login_ServersComboBox:UnlinkFromParent()
-		if UI.Login_AddServerBtn and UI.Login_AddServerBtn.IsChildOf and UI.Login_AddServerBtn:IsChildOf( self ) then
-			UI.Login_AddServerBtn:UnlinkFromParent()
+		local function UnlinkIfChild( w )
+			if w and w.IsChildOf and w:IsChildOf( self ) then
+				w:UnlinkFromParent()
+			end
 		end
+		UnlinkIfChild( UI.Login_ServerDockWnd )
+		UnlinkIfChild( UI.Login_AddServerBtn )
+		UnlinkIfChild( UI.Login_DefaultServerBtn )
+		UnlinkIfChild( UI.Login_DeleteServerBtn )
 		self:UpdateServerAddressWnd()
 		return
 	end
@@ -613,7 +1228,8 @@ function UI.LoginWnd:UpdateServersComboBox()
 	if self.defaultServerAddress and self.defaultServerAddress ~= "" then
 		for idx = 1, #self.servers do
 			local sInfo = self.servers[ idx ]
-			if sInfo.fullAddress == self.defaultServerAddress or (sInfo.isLocalhost and self.defaultServerAddress == "localhost") then
+			if (sInfo.fullAddress and string.lower( sInfo.fullAddress ) == string.lower( self.defaultServerAddress ))
+				or (sInfo.isLocalhost and self.defaultServerAddress == "localhost") then
 				matchedDefaultIdx = idx
 				break
 			end
@@ -625,7 +1241,7 @@ function UI.LoginWnd:UpdateServersComboBox()
 	if configAddress ~= "" and configAddress ~= "localhost" then
 		for idx = 1, #self.servers do
 			local sInfo = self.servers[ idx ]
-			if sInfo.fullAddress == configAddress then
+			if sInfo.fullAddress and string.lower( sInfo.fullAddress ) == string.lower( configAddress ) then
 				matchedConfigIdx = idx
 				break
 			end
@@ -645,13 +1261,30 @@ function UI.LoginWnd:UpdateServersComboBox()
 		end
 	end
 
-	-- Populate records into combobox
+	-- Populate records into combobox with native EffectComboBoxWnd color-coding (data.color)
 	for idx = 1, #self.servers do
 		local serverInfo = self.servers[ idx ]
-		local data = {}
-		data.serverInfo = serverInfo
-		data.address    = serverInfo.address
-		data.text       = serverInfo.displayName or serverInfo.name
+		local isDef = (self.defaultServerAddress and serverInfo.fullAddress and string.lower( self.defaultServerAddress ) == string.lower( serverInfo.fullAddress ))
+			or (serverInfo.isLocalhost and self.defaultServerAddress == "localhost")
+
+		local recordColor
+		if serverInfo.isCustom then
+			recordColor = SS_STYLE.COL_WARNING    -- Custom Server... (login "warning" orange)
+		elseif isDef then
+			recordColor = SS_STYLE.COL_GOLD       -- Active default (login button gold)
+		elseif serverInfo.isSaved then
+			recordColor = SS_STYLE.COL_WHITE      -- Saved servers
+		else
+			recordColor = SS_STYLE.COL_LIST_TEXT  -- Localhost (native list line blue)
+		end
+
+		local data =
+		{
+			serverInfo = serverInfo,
+			address    = serverInfo.address,
+			text       = serverInfo.displayName or serverInfo.name,
+			color      = recordColor,
+		}
 		UI.Login_ServersComboBox:AddRecord( data )
 	end
 
@@ -684,13 +1317,13 @@ function UI.LoginWnd:UpdateServersComboBox()
 		end
 	end
 
+	self:EnsureServerDockControls()
 	self:UpdateServerAddressWnd()
-	self:EnsureAddServerBtn()
 
 end
 
 -- ----------------------------------------------------------------------------
--- UpdateServerAddressWnd Override
+-- UpdateServerAddressWnd Override (Unlinks server_port from fixed 720p locator)
 -- ----------------------------------------------------------------------------
 function UI.LoginWnd:UpdateServerAddressWnd()
 
@@ -703,24 +1336,26 @@ function UI.LoginWnd:UpdateServerAddressWnd()
 		self:AddControl( UI.Login_ServerNameEditWnd, self.layers.MAIN_EFFECT, "server_name" )
 		self:AddControl( UI.Login_ServerPortEditWnd, self.layers.MAIN_EFFECT, "server_port" )
 
+		-- Unlink both fields from static .sanim locators so UpdateServerDockLayout
+		-- can position them cleanly without 1440p/4K overlap
+		pcall(function()
+			local effect = UI:GetEffectFromLayer( self, self.layers.MAIN_EFFECT )
+			if effect and effect.UnlinkWnd then
+				effect:UnlinkWnd( UI.Login_ServerNameEditWnd:GetUiHandle(), "" )
+				effect:UnlinkWnd( UI.Login_ServerPortEditWnd:GetUiHandle(), "" )
+			end
+		end)
+
 		UI.Login_ServerNameEditWnd:UpdateDummyText()
 		UI.Login_ServerPortEditWnd:UpdateDummyText()
-
-		if UI.Login_AddServerBtn and UI.Login_AddServerBtn.SetBtnText then
-			UI.Login_AddServerBtn:SetBtnText( "Save Server" )
-		end
 	else
 		self:RemoveControl( UI.Login_ServerNameEditWnd, self.layers.MAIN_EFFECT )
 		self:RemoveControl( UI.Login_ServerPortEditWnd, self.layers.MAIN_EFFECT )
 		UI.Login_ServerNameEditWnd:SetLayerVisible( false, UI.Login_ServerNameEditWnd.layers.DUMMY_TEXT )
 		UI.Login_ServerPortEditWnd:SetLayerVisible( false, UI.Login_ServerPortEditWnd.layers.DUMMY_TEXT )
-
-		if UI.Login_AddServerBtn and UI.Login_AddServerBtn.SetBtnText then
-			UI.Login_AddServerBtn:SetBtnText( "Add Server" )
-		end
 	end
 
-	self:UpdateAddServerBtnPos()
+	self:UpdateServerDockLayout()
 	self:UpdateFocus()
 
 end
@@ -750,6 +1385,8 @@ function UI.LoginWnd:UpdateConfigAddressFromComboBox()
 		cvars.net_masterServerAddress = serverInfo.address or ""
 	end
 
+	self:SyncServerActionStates()
+
 end
 
 function UI.LoginWnd:UpdateConfigAddressFromServerAddress()
@@ -774,13 +1411,26 @@ end
 -- ----------------------------------------------------------------------------
 -- LoginWnd Event Hooks
 -- ----------------------------------------------------------------------------
-
 local orig_LoginWnd_OnMouseLButtonDown = UI.LoginWnd.F_OnMouseLButtonDown
 function UI.LoginWnd:F_OnMouseLButtonDown( mouseX, mouseY, wndThatReceivedInput )
 	local wnd = UI:GetUiObjByHandleT( wndThatReceivedInput )
-	if wnd == UI.Login_AddServerBtn or (wnd and wnd.IsChildOf and wnd:IsChildOf( UI.Login_AddServerBtn )) then
-		self:OnAddServer()
-		return true
+	if wnd then
+		if wnd == UI.Login_AddServerBtn or (wnd.IsChildOf and wnd:IsChildOf( UI.Login_AddServerBtn )) then
+			self:OnAddServer()
+			return true
+		end
+		if wnd == UI.Login_DefaultServerBtn or (wnd.IsChildOf and wnd:IsChildOf( UI.Login_DefaultServerBtn )) then
+			if not UI.Login_DefaultServerBtn.isActionDisabled then
+				self:OnSetDefaultCurrentServer()
+			end
+			return true
+		end
+		if wnd == UI.Login_DeleteServerBtn or (wnd.IsChildOf and wnd:IsChildOf( UI.Login_DeleteServerBtn )) then
+			if not UI.Login_DeleteServerBtn.isActionDisabled then
+				self:OnDeleteCurrentServer()
+			end
+			return true
+		end
 	end
 	if orig_LoginWnd_OnMouseLButtonDown then
 		return orig_LoginWnd_OnMouseLButtonDown( self, mouseX, mouseY, wndThatReceivedInput )
@@ -793,14 +1443,49 @@ function UI.LoginWnd:F_OnScreenPosChanged( oldScreenX, oldScreenY )
 	if orig_LoginWnd_PosChanged then
 		orig_LoginWnd_PosChanged( self, oldScreenX, oldScreenY )
 	end
-	self:UpdateAddServerBtnPos()
+	self:UpdateServerDockLayout()
+end
+
+-- Resolution change / windowed resize: the engine resets the device and recomputes
+-- UI.screenWidth/Height, but nothing re-runs our layout, so sizes computed with SX/SY
+-- for the old resolution would stay (too big or too small, and the buttons' cached
+-- effect base size goes stale). Watch the screen size every frame and redo the layout
+-- when it changes. State lives in table fields: no new chunk-level locals (Lua's
+-- 200-local limit is shared with loginwnd.lua).
+UI.LoginWnd.ssPrevNewFrame = UI.LoginWnd.F_OnNewFrame
+function UI.LoginWnd:F_OnNewFrame( hSender, dt_sys, dt_game )
+	local prev = UI.LoginWnd.ssPrevNewFrame
+	if prev then
+		prev( self, hSender, dt_sys, dt_game )
+	end
+	local w, h = UI.screenWidth, UI.screenHeight
+	if self.ssScreenW ~= w or self.ssScreenH ~= h then
+		local first = self.ssScreenW == nil
+		self.ssScreenW, self.ssScreenH = w, h
+		if not first then
+			pcall(function()
+				for _, key in ipairs( { "Login_AddServerBtn", "Login_DefaultServerBtn", "Login_DeleteServerBtn" } ) do
+					if UI[ key ] then
+						UI[ key ].baseSize = nil    -- re-measure the effect at the new resolution
+					end
+				end
+				self:UpdateServerDockLayout()
+			end)
+		end
+	end
 end
 
 local orig_LoginWnd_Shutdown = UI.LoginWnd.F_Shutdown
 function UI.LoginWnd:F_Shutdown()
-	if UI.Login_AddServerBtn and UI.Login_AddServerBtn.IsChildOf and UI.Login_AddServerBtn:IsChildOf( self ) then
-		UI.Login_AddServerBtn:UnlinkFromParent()
+	local function UnlinkIfChild( w )
+		if w and w.IsChildOf and w:IsChildOf( self ) then
+			w:UnlinkFromParent()
+		end
 	end
+	UnlinkIfChild( UI.Login_ServerDockWnd )
+	UnlinkIfChild( UI.Login_AddServerBtn )
+	UnlinkIfChild( UI.Login_DefaultServerBtn )
+	UnlinkIfChild( UI.Login_DeleteServerBtn )
 	if orig_LoginWnd_Shutdown then
 		orig_LoginWnd_Shutdown( self )
 	end
@@ -811,9 +1496,15 @@ function UI.LoginWnd:Reset()
 	if orig_LoginWnd_Reset then
 		orig_LoginWnd_Reset( self )
 	end
-	if UI.Login_AddServerBtn and UI.Login_AddServerBtn.IsChildOf and UI.Login_AddServerBtn:IsChildOf( self ) then
-		UI.Login_AddServerBtn:UnlinkFromParent()
+	local function UnlinkIfChild( w )
+		if w and w.IsChildOf and w:IsChildOf( self ) then
+			w:UnlinkFromParent()
+		end
 	end
+	UnlinkIfChild( UI.Login_ServerDockWnd )
+	UnlinkIfChild( UI.Login_AddServerBtn )
+	UnlinkIfChild( UI.Login_DefaultServerBtn )
+	UnlinkIfChild( UI.Login_DeleteServerBtn )
 end
 
 local orig_RequestServersList = UI.LoginWnd.RequestServersList
@@ -834,9 +1525,8 @@ function UI.LoginWnd:MasterServer_OnServerAddresess( errcode, servers )
 end
 
 -- ----------------------------------------------------------------------------
--- ShowServerContextMenu
+-- ShowServerContextMenu (Right-Click Menu on Dropdown Slots)
 -- ----------------------------------------------------------------------------
-
 function UI.LoginWnd:ShowServerContextMenu( serverInfo, mouseX, mouseY )
 	if not serverInfo or serverInfo.isCustom or serverInfo.name == "server" then
 		return
@@ -857,7 +1547,8 @@ function UI.LoginWnd:ShowServerContextMenu( serverInfo, mouseX, mouseY )
 	end
 
 	local isLocalhost = serverInfo.isLocalhost
-	local isDefault = (self.defaultServerAddress == serverInfo.fullAddress) or (isLocalhost and (self.defaultServerAddress == "localhost" or self.defaultServerAddress == "" or self.defaultServerAddress == nil))
+	local isDefault = (self.defaultServerAddress and serverInfo.fullAddress and string.lower( self.defaultServerAddress ) == string.lower( serverInfo.fullAddress ))
+		or (isLocalhost and (self.defaultServerAddress == "localhost" or self.defaultServerAddress == "" or self.defaultServerAddress == nil))
 
 	-- 1. Set as Default
 	local defLabel = isDefault and "Default Server (Active)" or "Set as Default"
@@ -970,85 +1661,199 @@ def get_mod_code():
             pass
     return EMBEDDED_MOD_LUA
 
+# ----------------------------------------------------------------------------
+# Mods managed by this patcher. Every mod is one or more marker-delimited blocks
+# appended to loginwnd.lua, so several mods can be installed side by side and each
+# one installs / uninstalls without touching the others.
+# ----------------------------------------------------------------------------
+
+def _read_ui_overhaul_file(name):
+    path = get_resource_path(os.path.join("ui_overhaul", name))
+    if not path:
+        raise FileNotFoundError(f"ui_overhaul/{name} is missing next to the patcher")
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read()
+
+MODS = [
+    {
+        "id": "server_selector",
+        "name": "Server Selector",
+        "tagline": "ESSENTIAL",
+        "summary": "Save, switch and auto-select community servers right from the login screen.",
+        "features": [
+            "Server dropdown with localhost, saved servers and a custom entry",
+            "Add Server button, right-click Set as Default / Delete",
+            "Saved in your pilot profile; default server loads on launch (never auto-joins)",
+        ],
+        # (begin marker, end marker, source loader, source already contains the markers?)
+        "blocks": [(MOD_BEGIN_MARKER, MOD_END_MARKER, get_mod_code, False)],
+    },
+    {
+        "id": "ui_overhaul",
+        "name": "UI Overhaul",
+        "tagline": "FLAVOR & COMFORT",
+        "summary": "Animated login screen, built on TweenService: a Roblox-style animation library for screen replacements.",
+        "features": [
+            "Login intro: side buttons slide in, login fields fade in",
+            "Patch name gently pulses; side buttons nudge on hover",
+            "TweenService library for other mods (easing styles, repeat, reverse, delay)",
+        ],
+        "blocks": [
+            ("-- BEGIN TWEENSERVICE", "-- END TWEENSERVICE",
+             lambda: _read_ui_overhaul_file("tweenservice.lua"), True),
+            ("-- BEGIN LOGIN_TWEEN_DEMO", "-- END LOGIN_TWEEN_DEMO",
+             lambda: _read_ui_overhaul_file("login_tween_demo.lua"), True),
+        ],
+    },
+]
+MODS_BY_ID = {m["id"]: m for m in MODS}
+
+
+def _read_target_text(target):
+    """loginwnd.lua as text with \\n line endings, plus how to write it back (BOM, CRLF)."""
+    with open(target, "rb") as f:
+        raw = f.read()
+    bom = raw.startswith(b"\xef\xbb\xbf")
+    text = (raw[3:] if bom else raw).decode("utf-8", errors="replace")
+    return text.replace("\r\n", "\n"), bom, b"\r\n" in raw
+
+
+def _write_target_text(target, text, bom, crlf):
+    data = text.replace("\n", "\r\n") if crlf else text
+    with open(target, "wb") as f:
+        f.write((b"\xef\xbb\xbf" if bom else b"") + data.encode("utf-8"))
+
+
+def _strip_block(text, begin, end):
+    i = text.find(begin)
+    if i < 0:
+        return text, False
+    j = text.find(end, i)
+    if j < 0:
+        raise ValueError(f"'{begin}' has no matching '{end}' in loginwnd.lua")
+    return text[:i].rstrip() + "\n" + text[j + len(end):].lstrip("\n"), True
+
+
+def _block_text(block):
+    begin, end, loader, has_markers = block
+    src = loader().replace("\r\n", "\n").strip()
+    if has_markers:
+        if not (src.startswith(begin) and src.endswith(end)):
+            raise ValueError(f"mod source must start with '{begin}' and end with '{end}'")
+        return src
+    return f"{begin}\n{src}\n{end}"
+
+
+def _validate_lua(text):
+    """(ok, note). Compiles with Lua 5.1 when lupa is available (also catches Lua's
+    200-local limit, shared with loginwnd.lua); otherwise checks block balance."""
+    try:
+        import lupa.lua51 as lua51
+        rt = lua51.LuaRuntime(encoding="latin-1")
+        check = rt.eval("function(s) local f, e = loadstring(s, '=loginwnd.lua'); return f ~= nil, e end")
+        ok, err = check(text.encode("utf-8").decode("latin-1"))
+        return bool(ok), (err or "")
+    except ImportError:
+        pass
+    except Exception as e:
+        return False, str(e)
+    import re
+    s = re.sub(r"--\[\[.*?\]\]", "", text, flags=re.S)
+    s = re.sub(r"\[\[.*?\]\]", "", s, flags=re.S)
+    s = re.sub(r"--[^\n]*", "", s)
+    s = re.sub(r'"(\\.|[^"\\\n])*"', '""', s)
+    s = re.sub(r"'(\\.|[^'\\\n])*'", "''", s)
+    s = re.sub(r"\belseif\b.*?\bthen\b", "", s, flags=re.S)
+    depth = 0
+    for t in re.findall(r"\b(function|then|do|repeat|until|end)\b", s):
+        depth += 1 if t in ("function", "then", "do", "repeat") else -1
+        if depth < 0:
+            return False, "unbalanced 'end'"
+    return depth == 0, ("" if depth == 0 else "unclosed block")
+
+
+def mod_state(content, mod):
+    """'installed' | 'partial' | 'none'"""
+    found = [b[0] in content and b[1] in content for b in mod["blocks"]]
+    return "installed" if all(found) else ("partial" if any(found) else "none")
+
+
 def check_status(game_dir):
+    empty = {"exists": False, "installed": False, "has_backup": False, "target_file": "",
+             "backup_file": "", "mods": {m["id"]: "none" for m in MODS}}
     if not game_dir:
-        return {"exists": False, "installed": False, "has_backup": False, "target_file": "", "backup_file": ""}
+        return empty
     target = get_target_file(game_dir)
     backup = get_backup_file(game_dir)
+    status = dict(empty, target_file=target, backup_file=backup, has_backup=os.path.isfile(backup))
     if not os.path.isfile(target):
-        return {"exists": False, "installed": False, "has_backup": os.path.isfile(backup), "target_file": target, "backup_file": backup}
-
+        return status
     try:
-        with open(target, "r", encoding="utf-8", errors="ignore") as f:
-            content = f.read()
-        installed = (MOD_BEGIN_MARKER in content) and (MOD_END_MARKER in content)
+        content, _, _ = _read_target_text(target)
+        status["mods"] = {m["id"]: mod_state(content, m) for m in MODS}
     except Exception:
-        installed = False
+        pass
+    status["exists"] = True
+    status["installed"] = status["mods"]["server_selector"] == "installed"
+    return status
 
-    return {
-        "exists": True,
-        "installed": installed,
-        "has_backup": os.path.isfile(backup),
-        "target_file": target,
-        "backup_file": backup,
-    }
 
-def install_mod(game_dir):
+def install_mod(game_dir, mod_id="server_selector"):
+    mod = MODS_BY_ID[mod_id]
     target = get_target_file(game_dir)
     backup = get_backup_file(game_dir)
     if not os.path.isfile(target):
         return False, f"Target file not found: {target}"
-
     try:
-        with open(target, "r", encoding="utf-8", errors="ignore") as f:
-            content = f.read()
-
-        if MOD_BEGIN_MARKER in content:
-            prefix = content.split(MOD_BEGIN_MARKER)[0].rstrip()
-            suffix = ""
-            if MOD_END_MARKER in content:
-                suffix = content.split(MOD_END_MARKER)[1].lstrip("\r\n")
-            content = (prefix + "\n\n" + suffix).strip() + "\n"
-
+        content, bom, crlf = _read_target_text(target)
+        for begin, end, _, _ in reversed(mod["blocks"]):
+            content, _ = _strip_block(content, begin, end)
+        blocks = [_block_text(b) for b in mod["blocks"]]
+        new_content = content.rstrip() + "\n\n" + "\n\n".join(blocks) + "\n"
+        ok, err = _validate_lua(new_content)
+        if not ok:
+            return False, f"{mod['name']} was not installed: the patched script would not load ({err}). No files were changed."
         if not os.path.isfile(backup):
             shutil.copy2(target, backup)
-
-        mod_code = get_mod_code()
-        mod_block = f"\n\n{MOD_BEGIN_MARKER}\n{mod_code.strip()}\n{MOD_END_MARKER}\n"
-        new_content = content.rstrip() + mod_block
-
-        with open(target, "w", encoding="utf-8") as f:
-            f.write(new_content)
-
-        return True, "Successfully installed Server Selector Mod! Backup preserved at loginwnd.lua.orig."
+        _write_target_text(target, new_content, bom, crlf)
+        return True, f"Installed {mod['name']}. Clean backup preserved at loginwnd.lua.orig."
     except Exception as e:
         return False, f"Installation failed: {str(e)}"
 
-def uninstall_mod(game_dir):
+
+def uninstall_mod(game_dir, mod_id="server_selector"):
+    """Removes only this mod's blocks; other installed mods stay."""
+    mod = MODS_BY_ID[mod_id]
     target = get_target_file(game_dir)
-    backup = get_backup_file(game_dir)
     if not os.path.isfile(target):
         return False, f"Target file not found: {target}"
-
     try:
-        if os.path.isfile(backup):
-            shutil.copy2(backup, target)
-            return True, "Successfully restored original loginwnd.lua from clean backup."
-
-        with open(target, "r", encoding="utf-8", errors="ignore") as f:
-            content = f.read()
-
-        if MOD_BEGIN_MARKER in content and MOD_END_MARKER in content:
-            prefix = content.split(MOD_BEGIN_MARKER)[0].rstrip()
-            suffix = content.split(MOD_END_MARKER)[1].lstrip("\r\n")
-            cleaned = (prefix + "\n\n" + suffix).strip() + "\n"
-            with open(target, "w", encoding="utf-8") as f:
-                f.write(cleaned)
-            return True, "Successfully stripped mod markers. Original loginwnd.lua restored."
-
-        return True, "Mod was not installed. Game files are already clean."
+        content, bom, crlf = _read_target_text(target)
+        found = False
+        for begin, end, _, _ in reversed(mod["blocks"]):
+            content, f = _strip_block(content, begin, end)
+            found = found or f
+        if not found:
+            return True, f"{mod['name']} was not installed. Nothing changed."
+        ok, err = _validate_lua(content)
+        if not ok:
+            return False, f"Removal aborted: the script would not load afterwards ({err}). No files were changed."
+        _write_target_text(target, content.rstrip() + "\n", bom, crlf)
+        return True, f"Removed {mod['name']}. Other mods were left untouched."
     except Exception as e:
-        return False, f"Restoration failed: {str(e)}"
+        return False, f"Removal failed: {str(e)}"
+
+
+def restore_original(game_dir):
+    """Copies loginwnd.lua.orig back over loginwnd.lua (removes every mod)."""
+    target, backup = get_target_file(game_dir), get_backup_file(game_dir)
+    if not os.path.isfile(backup):
+        return False, "No loginwnd.lua.orig backup found."
+    try:
+        shutil.copy2(backup, target)
+        return True, "Restored the original loginwnd.lua from backup. All mods removed."
+    except Exception as e:
+        return False, f"Restore failed: {str(e)}"
 
 
 class StarConflictPatcherApp:
@@ -1057,17 +1862,17 @@ class StarConflictPatcherApp:
         
         # Initialize Omega borderless window with taskbar presence
         self.root = oui.create_omega_window(
-            title="Star Conflict · Server Selector Patcher",
+            title="Star Conflict · Community Mod Patcher",
             width=760,
-            height=660
+            height=760
         )
         
         # Center the window on the active display
         sw = self.root.winfo_screenwidth()
         sh = self.root.winfo_screenheight()
         x = max(0, (sw - 760) // 2)
-        y = max(0, (sh - 660) // 2)
-        self.root.geometry(f"760x660+{x}+{y}")
+        y = max(0, (sh - 760) // 2)
+        self.root.geometry(f"760x760+{x}+{y}")
         
         # Custom outer border for aesthetic definition
         self.outer_border = tk.Frame(self.root, bg=oui.Theme.ACCENT, padx=1, pady=1)
@@ -1082,7 +1887,7 @@ class StarConflictPatcherApp:
         # Title bar
         self.title_bar = oui.OmegaTitleBar(
             self.outer_border,
-            title="Star Conflict · Community Server Selector Patcher",
+            title="Star Conflict · Community Mod Patcher",
             border_width=1,
             border_color=oui.Theme.ACCENT,
             icon_path=self.icon_path,
@@ -1102,8 +1907,8 @@ class StarConflictPatcherApp:
 
         self._build_header()
         self._build_diagnostic_panel()
+        self._build_mod_tabs()
         self._build_path_selector()
-        self._build_action_section()
         self._build_status_banner()
         self._build_credits()
         self._build_footer()
@@ -1129,7 +1934,7 @@ class StarConflictPatcherApp:
 
         tk.Label(
             title_box,
-            text="Community Multi-Server Manager & Dropdown Patcher",
+            text="Community Mod Patcher · Server Selector & UI Overhaul",
             font=("Segoe UI", 9),
             fg=oui.Theme.TEXT,
             bg=oui.Theme.BG
@@ -1278,8 +2083,8 @@ class StarConflictPatcherApp:
         self.diag_target_badge = tk.Label(grid, text="[ CHECKING ]", font=("Segoe UI", 8, "bold"), fg=oui.Theme.DISABLED, bg=oui.Theme.PANEL)
         self.diag_target_badge.grid(row=1, column=2, sticky="e", pady=2)
 
-        # 3. Mod State
-        tk.Label(grid, text="Mod State:", font=("Segoe UI", 9), fg=oui.Theme.TEXT, bg=oui.Theme.PANEL).grid(row=2, column=0, sticky="w", pady=2)
+        # 3. Installed mods (summary; details live in the mod tabs below)
+        tk.Label(grid, text="Installed Mods:", font=("Segoe UI", 9), fg=oui.Theme.TEXT, bg=oui.Theme.PANEL).grid(row=2, column=0, sticky="w", pady=2)
         self.diag_mod_badge = tk.Label(grid, text="[ CHECKING ]", font=("Segoe UI", 8, "bold"), fg=oui.Theme.DISABLED, bg=oui.Theme.PANEL, anchor="w")
         self.diag_mod_badge.grid(row=2, column=1, sticky="w", padx=(10, 0), pady=2)
 
@@ -1287,6 +2092,122 @@ class StarConflictPatcherApp:
         tk.Label(grid, text="Original Backup:", font=("Segoe UI", 9), fg=oui.Theme.TEXT, bg=oui.Theme.PANEL).grid(row=3, column=0, sticky="w", pady=2)
         self.diag_backup_badge = tk.Label(grid, text="[ CHECKING ]", font=("Segoe UI", 8, "bold"), fg=oui.Theme.DISABLED, bg=oui.Theme.PANEL, anchor="w")
         self.diag_backup_badge.grid(row=3, column=1, sticky="w", padx=(10, 0), pady=2)
+        self.restore_link = tk.Label(grid, text="↺ Restore original", font=("Segoe UI", 8, "underline"),
+                                     fg="#94A3B8", bg=oui.Theme.PANEL, cursor="hand2")
+        self.restore_link.bind("<Button-1>", lambda e: self.do_restore_original())
+        self.restore_link.bind("<Enter>", lambda e: self.restore_link.config(fg=oui.Theme.DANGER))
+        self.restore_link.bind("<Leave>", lambda e: self.restore_link.config(fg="#94A3B8"))
+        oui.ToolTip(self.restore_link, "Copy loginwnd.lua.orig back over loginwnd.lua, removing ALL mods")
+
+    # ------------------------------------------------------------------ mod tabs
+    def _build_mod_tabs(self):
+        """Tab strip (one tab per mod) directly under the diagnostics, then the selected mod's card."""
+        wrap = tk.Frame(self.container, bg=oui.Theme.BG)
+        wrap.pack(fill=tk.X, pady=(0, 10))
+
+        strip = tk.Frame(wrap, bg=oui.Theme.BG)
+        strip.pack(fill=tk.X)
+        self.mod_tabs = {}
+        for mod in MODS:
+            tab = tk.Frame(strip, bg=oui.Theme.BG, cursor="hand2")
+            tab.pack(side=tk.LEFT, padx=(0, 4))
+            body = tk.Frame(tab, bg=oui.Theme.BG, padx=14, pady=6)
+            body.pack(fill=tk.X)
+            name = tk.Label(body, text=mod["name"].upper(), font=("Segoe UI", 9, "bold"), bg=oui.Theme.BG, fg="#94A3B8")
+            name.pack(side=tk.LEFT)
+            dot = tk.Label(body, text="", font=("Segoe UI", 9, "bold"), bg=oui.Theme.BG, fg=oui.Theme.SUCCESS)
+            dot.pack(side=tk.LEFT, padx=(6, 0))
+            bar = tk.Frame(tab, height=2, bg=oui.Theme.BG)
+            bar.pack(fill=tk.X)
+            for w in (tab, body, name, dot):
+                w.bind("<Button-1>", lambda e, mid=mod["id"]: self.select_mod_tab(mid))
+                w.bind("<Enter>", lambda e, mid=mod["id"]: self._hover_tab(mid, True))
+                w.bind("<Leave>", lambda e, mid=mod["id"]: self._hover_tab(mid, False))
+            self.mod_tabs[mod["id"]] = {"tab": tab, "body": body, "name": name, "dot": dot, "bar": bar}
+
+        self.mod_card = tk.Frame(wrap, bg=oui.Theme.PANEL, padx=14, pady=10)
+        self.mod_card.pack(fill=tk.X)
+        self.selected_mod = MODS[0]["id"]
+
+    def _hover_tab(self, mod_id, inside):
+        if mod_id != self.selected_mod:
+            self.mod_tabs[mod_id]["name"].config(fg=oui.Theme.TEXT if inside else "#94A3B8")
+
+    def select_mod_tab(self, mod_id):
+        self.selected_mod = mod_id
+        self.refresh_ui()
+
+    def _style_tabs(self):
+        for mid, t in self.mod_tabs.items():
+            active = mid == self.selected_mod
+            bg = oui.Theme.PANEL if active else oui.Theme.BG
+            for key in ("tab", "body", "name", "dot"):
+                t[key].config(bg=bg)
+            t["name"].config(fg=oui.Theme.ACCENT if active else "#94A3B8")
+            t["bar"].config(bg=oui.Theme.ACCENT if active else oui.Theme.BG)
+            state = self.status["mods"].get(mid, "none")
+            t["dot"].config(text={"installed": "●", "partial": "◐"}.get(state, ""),
+                            fg=oui.Theme.SUCCESS if state == "installed" else "#F59E0B")
+
+    def _render_mod_card(self):
+        for w in self.mod_card.winfo_children():
+            w.destroy()
+        mod = MODS_BY_ID[self.selected_mod]
+        state = self.status["mods"].get(mod["id"], "none")
+
+        top = tk.Frame(self.mod_card, bg=oui.Theme.PANEL)
+        top.pack(fill=tk.X)
+        tk.Label(top, text=mod["name"].upper(), font=("Segoe UI", 10, "bold"), fg=oui.Theme.ACCENT,
+                 bg=oui.Theme.PANEL).pack(side=tk.LEFT)
+        tk.Label(top, text=f"  {mod['tagline']}", font=("Segoe UI", 8, "bold"), fg="#64748B",
+                 bg=oui.Theme.PANEL).pack(side=tk.LEFT, pady=(2, 0))
+        if not self.status["exists"]:
+            txt, col = "✕ TARGET SCRIPT MISSING", oui.Theme.DANGER
+        else:
+            txt, col = {"installed": ("● INSTALLED & ACTIVE", oui.Theme.ACCENT),
+                        "partial": ("◐ PARTIALLY INSTALLED (reinstall to repair)", "#F59E0B")}.get(
+                state, ("○ NOT INSTALLED", "#94A3B8"))
+        tk.Label(top, text=txt, font=("Segoe UI", 8, "bold"), fg=col, bg=oui.Theme.PANEL).pack(side=tk.RIGHT)
+
+        tk.Label(self.mod_card, text=mod["summary"], font=("Segoe UI", 9), fg=oui.Theme.TEXT, bg=oui.Theme.PANEL,
+                 wraplength=680, justify="left").pack(anchor="w", pady=(4, 2))
+        for feat in mod["features"]:
+            tk.Label(self.mod_card, text="•  " + feat, font=("Segoe UI", 8), fg="#CBD5E1", bg=oui.Theme.PANEL,
+                     justify="left").pack(anchor="w")
+
+        # sources available?
+        missing = None
+        try:
+            for b in mod["blocks"]:
+                _block_text(b)
+        except Exception as e:
+            missing = str(e)
+        if missing:
+            tk.Label(self.mod_card, text="⚠ " + missing, font=("Segoe UI", 8, "bold"), fg="#F59E0B",
+                     bg=oui.Theme.PANEL).pack(anchor="w", pady=(6, 0))
+
+        actions = tk.Frame(self.mod_card, bg=oui.Theme.PANEL)
+        actions.pack(pady=(10, 2))
+        self.action_frame = actions
+        if not self.game_dir or not self.status["exists"]:
+            oui.OmegaButton(actions, text="⚙ Browse to Locate Star Conflict Directory...", command=self.browse_directory,
+                            width=340, height=38, corner_radius=8, bg_color=oui.Theme.BTN, hover_color=oui.Theme.BTN_HOVER,
+                            parent_bg=oui.Theme.PANEL, tooltip="Select the folder where Star Conflict is installed").pack()
+        elif state == "none":
+            if not missing:
+                oui.OmegaButton(actions, text=f"⚡ Install {mod['name']}", command=lambda: self.do_install(mod["id"]),
+                                width=260, height=40, corner_radius=8, bg_color=oui.Theme.SUCCESS,
+                                hover_color=oui.Theme.SUCCESS_HOVER, parent_bg=oui.Theme.PANEL,
+                                tooltip="Backs up the original loginwnd.lua (once) and adds this mod next to any others").pack()
+        else:
+            if not missing:
+                oui.OmegaButton(actions, text="↻ Reinstall / Update", command=lambda: self.do_install(mod["id"]),
+                                width=190, height=38, corner_radius=8, bg_color=oui.Theme.BTN, hover_color=oui.Theme.BTN_HOVER,
+                                parent_bg=oui.Theme.PANEL, tooltip="Re-applies the latest code for this mod").pack(side=tk.LEFT, padx=6)
+            oui.OmegaButton(actions, text=f"↺ Uninstall {mod['name']}", command=lambda: self.do_uninstall(mod["id"]),
+                            width=230, height=38, corner_radius=8, bg_color=oui.Theme.DANGER,
+                            hover_color=oui.Theme.DANGER_HOVER, parent_bg=oui.Theme.PANEL,
+                            tooltip="Removes only this mod's code; other mods stay installed").pack(side=tk.LEFT, padx=6)
 
     def _build_path_selector(self):
         card = tk.Frame(self.container, bg=oui.Theme.PANEL, padx=14, pady=10)
@@ -1350,10 +2271,6 @@ class StarConflictPatcherApp:
             tooltip="Auto-detect game from Steam libraries and Windows registry"
         )
         self.rescan_btn.pack(side=tk.LEFT)
-
-    def _build_action_section(self):
-        self.action_frame = tk.Frame(self.container, bg=oui.Theme.BG)
-        self.action_frame.pack(fill=tk.X, pady=(6, 6))
 
     def _build_status_banner(self):
         self.banner_frame = tk.Frame(self.container, bg=oui.Theme.PANEL, padx=12, pady=8, highlightthickness=1, highlightbackground="#1E293B")
@@ -1461,90 +2378,37 @@ class StarConflictPatcherApp:
         else:
             self.diag_target_badge.config(text="[ NOT FOUND ]", fg=oui.Theme.DANGER)
 
-        if self.status["installed"]:
-            self.diag_mod_badge.config(text="● INSTALLED & ACTIVE", fg=oui.Theme.ACCENT)
-        elif self.status["exists"]:
-            self.diag_mod_badge.config(text="○ NOT INSTALLED", fg="#94A3B8")
-        else:
+        installed = [m["name"] for m in MODS if self.status["mods"].get(m["id"]) == "installed"]
+        partial = [m["name"] for m in MODS if self.status["mods"].get(m["id"]) == "partial"]
+        if not self.status["exists"]:
             self.diag_mod_badge.config(text="✕ TARGET SCRIPT MISSING", fg=oui.Theme.DANGER)
+        elif installed or partial:
+            txt = "● " + ", ".join(installed) + (("  ◐ partial: " + ", ".join(partial)) if partial else "")
+            self.diag_mod_badge.config(text=txt.replace("●  ◐", "◐"), fg=oui.Theme.ACCENT)
+        else:
+            self.diag_mod_badge.config(text="○ NONE", fg="#94A3B8")
 
         if self.status["has_backup"]:
             self.diag_backup_badge.config(text="● PRESERVED (loginwnd.lua.orig)", fg=oui.Theme.SUCCESS)
-        elif self.status["exists"]:
-            self.diag_backup_badge.config(text="○ NONE (Will auto-backup on first install)", fg="#64748B")
+            self.restore_link.grid(row=3, column=2, sticky="e", pady=2)
         else:
-            self.diag_backup_badge.config(text="—", fg="#64748B")
+            self.restore_link.grid_remove()
+            if self.status["exists"]:
+                self.diag_backup_badge.config(text="○ NONE (Will auto-backup on first install)", fg="#64748B")
+            else:
+                self.diag_backup_badge.config(text="—", fg="#64748B")
 
-        if self.status["installed"]:
-            self.diag_indicator.config(text="● MOD ACTIVE", fg=oui.Theme.ACCENT)
-        elif self.status["exists"]:
-            self.diag_indicator.config(text="● READY TO INSTALL", fg=oui.Theme.SUCCESS)
-        else:
+        if not self.status["exists"]:
             self.diag_indicator.config(text="● GAME NOT FOUND", fg=oui.Theme.DANGER)
-
-        # 3. Rebuild Action Buttons
-        for w in self.action_frame.winfo_children():
-            w.destroy()
-
-        if not self.game_dir or not self.status["exists"]:
-            btn = oui.OmegaButton(
-                self.action_frame,
-                text="⚙ Browse to Locate Star Conflict Directory...",
-                command=self.browse_directory,
-                width=340,
-                height=38,
-                corner_radius=8,
-                bg_color=oui.Theme.BTN,
-                hover_color=oui.Theme.BTN_HOVER,
-                parent_bg=oui.Theme.BG,
-                tooltip="Select the folder where Star Conflict is installed"
-            )
-            btn.pack(pady=4)
-        elif not self.status["installed"]:
-            btn = oui.OmegaButton(
-                self.action_frame,
-                text="⚡ Install Server Selector Mod",
-                command=self.do_install,
-                width=290,
-                height=40,
-                corner_radius=8,
-                bg_color=oui.Theme.SUCCESS,
-                hover_color=oui.Theme.SUCCESS_HOVER,
-                parent_bg=oui.Theme.BG,
-                tooltip="Backs up original loginwnd.lua and installs community server selector"
-            )
-            btn.pack(pady=4)
+        elif installed:
+            n = len(installed)
+            self.diag_indicator.config(text=f"● {n} MOD{'S' if n > 1 else ''} ACTIVE", fg=oui.Theme.ACCENT)
         else:
-            row = tk.Frame(self.action_frame, bg=oui.Theme.BG)
-            row.pack(pady=2)
+            self.diag_indicator.config(text="● READY TO INSTALL", fg=oui.Theme.SUCCESS)
 
-            update_btn = oui.OmegaButton(
-                row,
-                text="↻ Reinstall / Update Mod",
-                command=self.do_install,
-                width=210,
-                height=38,
-                corner_radius=8,
-                bg_color=oui.Theme.BTN,
-                hover_color=oui.Theme.BTN_HOVER,
-                parent_bg=oui.Theme.BG,
-                tooltip="Re-applies the latest server selector mod code cleanly"
-            )
-            update_btn.pack(side=tk.LEFT, padx=6)
-
-            uninst_btn = oui.OmegaButton(
-                row,
-                text="↺ Uninstall Mod (Restore Original)",
-                command=self.do_uninstall,
-                width=270,
-                height=38,
-                corner_radius=8,
-                bg_color=oui.Theme.DANGER,
-                hover_color=oui.Theme.DANGER_HOVER,
-                parent_bg=oui.Theme.BG,
-                tooltip="Restores clean original loginwnd.lua from backup"
-            )
-            uninst_btn.pack(side=tk.LEFT, padx=6)
+        # 3. Mod tabs + selected mod card (with its action buttons)
+        self._style_tabs()
+        self._render_mod_card()
 
     def set_banner(self, text, color=None):
         if color is None:
@@ -1589,28 +2453,34 @@ class StarConflictPatcherApp:
             self.set_banner("✕ Could not auto-detect Star Conflict. Please use '⚙ Browse'.", oui.Theme.DANGER)
         self.refresh_ui()
 
-    def do_install(self):
+    def do_install(self, mod_id=None):
         if not self.game_dir:
             self.set_banner("✕ Please specify a valid Star Conflict installation directory first.", oui.Theme.DANGER)
             return
-
-        success, msg = install_mod(self.game_dir)
-        if success:
-            self.set_banner("✔ " + msg, oui.Theme.SUCCESS)
-        else:
-            self.set_banner("✕ " + msg, oui.Theme.DANGER)
+        success, msg = install_mod(self.game_dir, mod_id or self.selected_mod)
+        self.set_banner(("✔ " if success else "✕ ") + msg, oui.Theme.SUCCESS if success else oui.Theme.DANGER)
         self.refresh_ui()
 
-    def do_uninstall(self):
+    def do_uninstall(self, mod_id=None):
         if not self.game_dir:
             self.set_banner("✕ Please specify a valid Star Conflict directory first.", oui.Theme.DANGER)
             return
+        success, msg = uninstall_mod(self.game_dir, mod_id or self.selected_mod)
+        self.set_banner(("✔ " if success else "✕ ") + msg, oui.Theme.SUCCESS if success else oui.Theme.DANGER)
+        self.refresh_ui()
 
-        success, msg = uninstall_mod(self.game_dir)
-        if success:
-            self.set_banner("✔ " + msg, oui.Theme.SUCCESS)
-        else:
-            self.set_banner("✕ " + msg, oui.Theme.DANGER)
+    def do_restore_original(self):
+        if not self.game_dir:
+            return
+        if not messagebox.askyesno(
+                "Restore original loginwnd.lua",
+                "This copies loginwnd.lua.orig back over loginwnd.lua and removes ALL mods.\n\n"
+                "If the game was updated since the backup was made, the backup may be older than the "
+                "game's current file; prefer uninstalling mods one by one in that case.\n\nContinue?",
+                parent=self.root):
+            return
+        success, msg = restore_original(self.game_dir)
+        self.set_banner(("✔ " if success else "✕ ") + msg, oui.Theme.SUCCESS if success else oui.Theme.DANGER)
         self.refresh_ui()
 
     def open_how_it_works(self):
@@ -1691,12 +2561,12 @@ class StarConflictPatcherApp:
         add_bullet(
             s1,
             "Strict Boundary Isolation",
-            "All injected mod code is enclosed between explicit markers (-- BEGIN STAR CONFLICT SERVER SELECTOR MOD and -- END ...). No other game routines or assets are altered."
+            "Each mod's code is enclosed between its own explicit markers (e.g. -- BEGIN STAR CONFLICT SERVER SELECTOR MOD / -- END ...), so mods sit side by side. Before writing, the patched script is checked so a broken file is never saved. No other game routines or assets are altered."
         )
         add_bullet(
             s1,
-            "Complete One-Click Restoration",
-            "Clicking 'Uninstall Mod' instantly restores the untouched loginwnd.lua.orig backup back over loginwnd.lua, leaving zero residual traces."
+            "Independent Uninstall & Full Restore",
+            "Uninstalling a mod removes only that mod's block, leaving the others working. '↺ Restore original' (next to the backup status) copies loginwnd.lua.orig back and removes every mod at once."
         )
 
         # 2. How it works
@@ -1714,7 +2584,7 @@ class StarConflictPatcherApp:
         add_bullet(
             s2,
             "Multi-Server Persistence Engine",
-            "Saves server configurations directly using the engine's built-in GetProfileTable() with a resilient disk fallback to saved_servers.cfg in your Star Conflict user profile directory. Your servers survive game updates."
+            "Saves server configurations to your pilot profile using the engine's built-in GetProfileTable() and Profile:Save(), immediately after every change. Your saved servers and default choice survive restarts."
         )
         add_bullet(
             s2,
@@ -1725,6 +2595,19 @@ class StarConflictPatcherApp:
             s2,
             "Default Auto-Selection (No Auto-Join)",
             "On game startup, the mod automatically selects your chosen default server. It never auto-joins; the pilot retains full control to review credentials and hit [Play] manually."
+        )
+
+        # 2b. UI Overhaul
+        s2b = make_section("2b · UI OVERHAUL (FLAVOR & COMFORT)", "Optional second mod: animation and screen replacements")
+        add_bullet(
+            s2b,
+            "TweenService",
+            "A Roblox-style animation library written in plain Lua (TweenInfo, easing styles, repeat, reverse, delay, Completed events). It runs on the login window's per-frame update, so no engine changes are needed."
+        )
+        add_bullet(
+            s2b,
+            "Animated Login",
+            "On opening the login screen the side buttons slide in one after another, the login fields fade in, the patch name pulses, and side buttons nudge on hover. Functionally nothing changes; it is purely visual and works alongside the Server Selector."
         )
 
         # 3. Community encouragement

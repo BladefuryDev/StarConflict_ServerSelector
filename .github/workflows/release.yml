@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       tag_name:
-        description: 'Release tag name (e.g. v1.1.0)'
+        description: 'Release tag name (e.g. v1.2.0)'
         required: true
-        default: 'v1.1.0'
+        default: 'v1.2.0'
 
 permissions:
   contents: write
@@ -34,7 +34,7 @@ jobs:
           elif [ -n "${{ inputs.tag_name }}" ]; then
             echo "tag=${{ inputs.tag_name }}" >> $GITHUB_OUTPUT
           else
-            echo "tag=v1.1.0" >> $GITHUB_OUTPUT
+            echo "tag=v1.2.0" >> $GITHUB_OUTPUT
           fi
 
       - name: Set up Python
@@ -49,12 +49,12 @@ jobs:
 
       - name: Build standalone executable (PyInstaller)
         run: |
-          python -m PyInstaller --onefile --noconsole --name StarConflict_Patcher --icon=star_conflict.ico --add-data "star_conflict.ico;." --add-data "server_selector_mod.lua;." --add-data "omega_ui.py;." StarConflict_Patcher.pyw
+          python -m PyInstaller --onefile --noconsole --name StarConflict_Patcher --icon=star_conflict.ico --add-data "star_conflict.ico;." --add-data "server_selector_mod.lua;." --add-data "omega_ui.py;." --add-data "ui_overhaul;ui_overhaul" StarConflict_Patcher.pyw
 
       - name: Create Portable Zip Package
         shell: powershell
         run: |
-          Compress-Archive -Path "StarConflict_Patcher.pyw", "omega_ui.py", "star_conflict.ico", "server_selector_mod.lua", "README.md", "Launch_Patcher.bat" -DestinationPath "dist\StarConflict_Patcher_Portable.zip" -Force
+          Compress-Archive -Path "StarConflict_Patcher.pyw", "omega_ui.py", "star_conflict.ico", "server_selector_mod.lua", "ui_overhaul", "README.md", "Launch_Patcher.bat" -DestinationPath "dist\StarConflict_Patcher_Portable.zip" -Force
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
