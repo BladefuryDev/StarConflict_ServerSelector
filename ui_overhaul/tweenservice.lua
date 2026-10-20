@@ -106,6 +106,14 @@ do
 			self.handlers[ #self.handlers + 1 ] = h
 			return { Disconnect = function() h.fn = nil end }
 		end
+		function s:Once( fn )
+			local conn
+			conn = self:Connect( function( ... )
+				if conn then conn:Disconnect() end
+				if fn then fn( ... ) end
+			end )
+			return conn
+		end
 		function s:Fire( ... )
 			for i = 1, #self.handlers do
 				local f = self.handlers[ i ].fn
@@ -135,15 +143,19 @@ do
 
 	local function isUserdataVec( v ) return type( v ) == "userdata" and v.x ~= nil end
 	local function lerpValue( a, b, t, isColor )
-		if isColor then return lerpColor( a, b, t ) end
 		local ta = type( a )
+		if ta == "table" and type( a.Lerp ) == "function" then return a:Lerp( b, t ) end
+		if isColor then return lerpColor( a, b, t ) end
 		if ta == "number" then return a + ( b - a ) * t end
 		if isUserdataVec( a ) or isUserdataVec( b ) or ( ta == "table" and a.x ~= nil ) then
 			local bx, by = b.x or b[ 1 ], b.y or b[ 2 ]
 			local x, y = a.x + ( bx - a.x ) * t, a.y + ( by - a.y ) * t
-			if a.z ~= nil or a.w ~= nil then
-				local bz, bw = b.z or b[ 3 ], b.w or b[ 4 ]
-				return UI:Quat( x, y, a.z + ( bz - a.z ) * t, a.w + ( bw - a.w ) * t )
+			local hasZ, az = pcall( function() return a.z end )
+			if hasZ and az ~= nil then
+				local bz = b.z or ( type( b ) == "table" and b[ 3 ] ) or 0
+				local bw = b.w or ( type( b ) == "table" and b[ 4 ] ) or 0
+				local okW, aw = pcall( function() return a.w end )
+				return UI:Quat( x, y, az + ( bz - az ) * t, ( okW and aw or 0 ) + ( bw - ( okW and aw or 0 ) ) * t )
 			end
 			return UI:Vec2( x, y )
 		end
@@ -178,9 +190,13 @@ do
 		base = { layers = {}, effects = {}, t = 0 }
 		local n = wnd:GetNumLayers() or 0
 		for i = 0, n - 1 do
-			base.layers[ i ] = floor( u32( wnd:GetColor( i ) ) / 16777216 )
+			local a = floor( u32( wnd:GetColor( i ) ) / 16777216 )
+			base.layers[ i ] = a > 0 and a or 255
 			local eff = UI.GetEffectFromLayer and UI:GetEffectFromLayer( wnd, i )
-			if eff then base.effects[ i ] = eff:GetAlpha() or 255 end    -- effect alpha is 0..255
+			if eff then
+				local ea = eff:GetAlpha() or 255
+				base.effects[ i ] = ea > 0 and ea or 255
+			end
 		end
 		wndAlphaBase[ wnd ] = base
 		return base
@@ -212,12 +228,21 @@ do
 		Rect   = { get = function( w ) return w:GetRect() end, set = function( w, v ) w:SetRect( v ) end },
 		Transparency = { get = function( w ) return ( wndAlphaBase[ w ] or { t = 0 } ).t end,
 		                 set = setWndTransparency },
+		hoverMix = { get = function( w ) return w.hoverMix or 0 end,
+		             set = function( w, v ) w.hoverMix = v end },
 	}
 	TS:AddAdapter( {
 		name = "window", props = wndProps,
 		accepts = isWnd,
-		get = function( w, p ) local d = wndProps[ p ]; return d and d.get( w ) end,
-		set = function( w, p, v ) local d = wndProps[ p ]; if d then d.set( w, v ) end end,
+		get = function( w, p )
+			local d = wndProps[ p ]
+			if d then return d.get( w ) end
+			return w[ p ]
+		end,
+		set = function( w, p, v )
+			local d = wndProps[ p ]
+			if d then d.set( w, v ) else w[ p ] = v end
+		end,
 	} )
 
 	-- layer proxy: TweenService:Layer( wnd, idx )
@@ -295,7 +320,11 @@ do
 	-- anything kept across frames must copy out its components first.
 	local function copyVec( v )
 		if isUserdataVec( v ) then
-			if v.z ~= nil or v.w ~= nil then return { x = v.x, y = v.y, z = v.z, w = v.w } end
+			local ok, z = pcall( function() return v.z end )
+			if ok and z ~= nil then
+				local okW, w = pcall( function() return v.w end )
+				return { x = v.x, y = v.y, z = z, w = okW and w or 0 }
+			end
 			return { x = v.x, y = v.y }
 		end
 		return v
@@ -310,9 +339,14 @@ do
 		local g = {}
 		for p, v in pairs( goals or {} ) do
 			if adapter.props and not adapter.props[ p ] then
-				log( "Create: %s has no tweenable property %s", adapter.name, tostring( p ) )
+				if type( target ) == "table" and ( target[ p ] ~= nil or type( v ) == "number" ) then
+					g[ p ] = copyVec( v )
+				else
+					log( "Create: %s has no tweenable property %s", adapter.name, tostring( p ) )
+				end
+			else
+				g[ p ] = copyVec( v )
 			end
-			g[ p ] = copyVec( v )
 		end
 		local tw = setmetatable( {
 			Instance = target, TweenInfo = info or TweenInfo.new(), goals = g,

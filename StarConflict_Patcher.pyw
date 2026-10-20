@@ -19,7 +19,7 @@ import webbrowser
 import tkinter as tk
 from tkinter import filedialog, messagebox
 
-APP_VERSION = "v1.2.0"
+APP_VERSION = "v1.2.1"
 GITHUB_REPO = "BladefuryDev/StarConflict_ServerSelector"
 GITHUB_RELEASES_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 GITHUB_PROJECT_URL = f"https://github.com/{GITHUB_REPO}"
@@ -1692,15 +1692,18 @@ MODS = [
         "id": "ui_overhaul",
         "name": "UI Overhaul",
         "tagline": "FLAVOR & COMFORT",
-        "summary": "Animated login screen, built on TweenService: a Roblox-style animation library for screen replacements.",
+        "summary": "Cinematic login boot, classic golden MMO play button + Quick-Play mode, and Roblox-style UI toolkit (TweenService + RbxUI).",
         "features": [
-            "Login intro: side buttons slide in, login fields fade in",
-            "Patch name gently pulses; side buttons nudge on hover",
-            "TweenService library for other mods (easing styles, repeat, reverse, delay)",
+            "Cinematic login boot: seamless fade-from-black with centered zoom-out and staggered UI cascade",
+            "Classic MMO Golden Play button: auto-minimizes when 'Remember me' is checked into quick-play mode",
+            "Responsive Welcome Bar with one-click credential editing, button hover feedback, and accent pulses",
+            "Roblox-style UI toolkit: TweenService, RbxUI DOM, UIStrokes, UICorners, UIGradients, and layouts",
         ],
         "blocks": [
             ("-- BEGIN TWEENSERVICE", "-- END TWEENSERVICE",
              lambda: _read_ui_overhaul_file("tweenservice.lua"), True),
+            ("-- BEGIN RBXUI", "-- END RBXUI",
+             lambda: _read_ui_overhaul_file("rbxui.lua"), True),
             ("-- BEGIN LOGIN_TWEEN_DEMO", "-- END LOGIN_TWEEN_DEMO",
              lambda: _read_ui_overhaul_file("login_tween_demo.lua"), True),
         ],

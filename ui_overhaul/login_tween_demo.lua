@@ -1,40 +1,42 @@
 -- BEGIN LOGIN_TWEEN_DEMO
 -- ============================================================================
--- Demo: cinematic animated login screen built on TweenService (append after
--- tweenservice.lua to data/ui/scripts/windows/loginwnd.lua, or in scui:
---   python -m scui run examples/login_tween_demo.json
---       --mod mods/tweenservice.lua --mod mods/login_tween_demo.lua --out-dir shots)
+-- Demo: cinematic animated login screen + Golden Play Button ("Remember Me"
+-- Quick-Play mode) built on TweenService.
 --
--- Boot sequence:
--- * Smoothly fades in from pure black (seamless handoff from the initial loading
---   screen with the loading circle) while the space background starts slightly
---   zoomed in (1.10x, centered) and smoothly zooms out to 1.0x.
--- * Shortly after the fade/zoom begins, the UI chrome (top-left logo & bottom bar),
---   login fields, Server Selector dock/buttons, and staggered right-hand menu
---   column animate in.
--- * "Legacy of the Precursors" fades in and then pulses between white and login
---   accent gold.
--- * Side buttons grow slightly on hover (via UpdateEffectAnimation, a Lua-to-Lua
---   call, so it works no matter how the engine dispatches F_ callbacks).
---
--- Layout rule: windows and layers are placed by locators in login_main.sanim
--- (links on LoginWnd's MAIN_EFFECT), which the engine re-applies for every screen
--- size. To animate one we unlink it, and we re-link it as soon as the animation ends,
--- so resolution changes and windowed resizes keep working natively. If the screen
--- size changes mid-animation, everything snaps back to its links and resting state.
+-- Features:
+-- * Boot sequence: smoothly fades in from pure black while the space background
+--   starts slightly zoomed in (1.10x, centered) and smoothly zooms out to 1.0x.
+-- * Quick-Play / Remember Me mode:
+--   - Initializes with the classic MMO Golden Play Button (UI.Login_SteamLogInBtn,
+--     login_enter_2.sanim) and "Welcome, #Username# | Click here to change."
+--     beneath it whenever saved account information ("Remember me") exists.
+--   - Checking "Remember me" on the login form minimizes the input fields into
+--     "Welcome, #Username# | Click here to change." and lets the Golden Play
+--     Button appear with a responsive slide-down and fade-in animation.
+--   - Clicking "Welcome, #Username# | Click here to change." smoothly expands
+--     back to the E-mail / Password form for switching accounts.
+-- * Side menu buttons & Golden Play Button grow slightly on hover.
 -- ============================================================================
 do
 	local TS = TweenService
 	if not TS then return end
 
 	local LW = UI.LoginWnd
-	local demo = { played = false, tweens = {}, hover = {} }
+	local demo = {
+		played          = false,
+		isMinimized     = false,
+		pendingMinimize = false,
+		tweens          = {},
+		authTweens      = {},
+		hover           = {},
+	}
 	LoginTweenDemo = demo
 
 	local SIDE = { "UI.Login_OptionsBtn", "UI.Login_StartServerBtn", "UI.Login_SiteBtn", "UI.Login_CreditsBtn",
 	               "UI.Login_LicenseBtn", "UI.Login_PrivacyPolicyBtn", "UI.Login_TermsOfUseBtn", "UI.Login_QuitBtn" }
-	local FIELDS = { "UI.Login_AccountEditWnd", "UI.Login_PasswordEditWnd", "UI.Login_RememberCheckBox", "UI.Login_LogInBtn",
-	                 "UI.Login_ForgetBtn", "UI.Login_RegisterBtn", "UI.Login_SteamLogInBtn", "UI.Login_ArcLogInBtn" }
+	local FORM_FIELDS = { "UI.Login_AccountEditWnd", "UI.Login_PasswordEditWnd",
+	                      "UI.Login_RememberCheckBox", "UI.Login_LogInBtn",
+	                      "UI.Login_ForgetBtn", "UI.Login_RegisterBtn" }
 	local SERVER_UI = { "UI.Login_ServerDockWnd", "UI.Login_ServersComboBox", "UI.Login_AddServerBtn",
 	                    "UI.Login_DefaultServerBtn", "UI.Login_DeleteServerBtn", "UI.Login_ServerNameEditWnd",
 	                    "UI.Login_ServerPortEditWnd", "UI.NewsWnd" }
@@ -47,22 +49,230 @@ do
 	local BG_ZOOM_TIME   = 1.60    -- smooth zoom-out duration (s)
 	local BG_FADE_TIME   = 0.90    -- fade-in from black duration (s)
 	local UI_START_DELAY = 0.35    -- beat before UI menu elements begin loading in (s)
-	local HOVER_TIME     = 0.075   -- half of the original 0.15s hover duration
+	local HOVER_TIME     = 0.075   -- snappy hover duration (s)
 	local HOVER_SCALE    = 1.04    -- subtle 4% grow from the button's centre
+	local PLAY_HOVER_SCL = 1.05    -- golden play button hover scale factor
 
 	local function log( fmt, ... ) if sys and sys.log then pcall( sys.log, "LoginTweenDemo: " .. fmt, ... ) end end
+
+	local RES_720 = { x = 1280, y = 720 }
+	local function SX( v ) return UI:XTo1024x768( v, RES_720 ) end
+	local function SY( v ) return UI:YTo1024x768( v, RES_720 ) end
+	local PLAY_HOVER_LIFT = SY( 4 )    -- golden play button pure vertical lift on hover (no horizontal shift)
 
 	local function wndByName( name )
 		local ok, t = pcall( UI.GetValByName, UI, name )
 		return ( ok and t and t.w and t:IsOnScreen() ) and t or nil
 	end
 
+	local function wndAny( name )
+		local ok, t = pcall( UI.GetValByName, UI, name )
+		return ( ok and t and t.w ) and t or nil
+	end
+
 	local function mainEffect() return UI:GetEffectFromLayer( LW, LW.layers.MAIN_EFFECT ) end
 
-	-- Applies centered scale (around Rel 512, 384) and color tint to the background
-	-- artwork layers (BG_EFFECT and BG2_EFFECT). Using opaque black tint (0xFF000000)
-	-- at t=0 rather than alpha=0 guarantees the 3D scene behind LoginWnd never bleeds
-	-- through during the fade-in from black.
+	-- -------------------------------------------------------------------------
+	-- Font & Text Measurement Helpers for UI.Login_WelcomeBarBtn
+	-- -------------------------------------------------------------------------
+	local function safeFont( fontName )
+		for _, name in ipairs( { fontName or "Small", "Small" } ) do
+			if UI and UI.GetFontByPatternName then
+				local h = UI:GetFontByPatternName( name )
+				if h and h ~= FONT.INVALID_FONT_HANDLE then return h end
+			end
+			if _G and _G.ObtainFont then
+				local h = _G.ObtainFont( name )
+				if h and h ~= FONT.INVALID_FONT_HANDLE then return h end
+			end
+		end
+		return FONT.INVALID_FONT_HANDLE
+	end
+
+	local function measureTextW( str, hFont )
+		if _G.MeasureText and str and str ~= "" and hFont then
+			local dummy = UI:Quat( 0, 0, 10000, 10000 )
+			local res = _G.MeasureText( str, hFont, dummy, FONT.TF_SINGLELINE + FONT.TF_NOCLIP, dummy )
+			if res and res.z and res.z > 0 then return res.z end
+		end
+		return SX( string.len( str or "" ) * 6.5 )
+	end
+
+	local function currentUsername()
+		local accWnd = UI.Login_AccountEditWnd
+		local acc = ( accWnd and accWnd.GetEditText and accWnd:GetEditText() ) or ""
+		if acc == "" then
+			local prof = _G.GetProfileTable and _G.GetProfileTable()
+			acc = ( prof and prof.lastAccount ) or ""
+		end
+		return acc
+	end
+
+	-- -------------------------------------------------------------------------
+	-- UI.Login_WelcomeBarBtn ("Welcome, #Username# | Click here to change.")
+	-- Placed directly beneath the Golden Play Button (UI.Login_SteamLogInBtn)
+	-- -------------------------------------------------------------------------
+	UI.Login_WelcomeBarBtn = {
+		def = {
+			className = "Wnd",
+			props = {
+				name  = "Login_WelcomeBarBtn",
+				style = UI.WS_NOT_KB_REACT,
+			},
+			layers = {
+				-- 0: Base transparent plate
+				{
+					layerType  = UI.LAYER_TEXTURE,
+					layerStyle = UI.WLS_RESIZABLE,
+					texture    = "white",
+					color      = 0x00000000,
+				},
+				-- 1: Owner-drawn text and accents
+				{
+					layerType    = UI.LAYER_TEXT,
+					layerStyle   = UI.WLS_OWNERDRAW + UI.WLS_RESIZABLE,
+					font         = { fontName = "Small" },
+					formatFlags  = ( FONT.TF_HCENTER or 2 ) + ( FONT.TF_VCENTER or 32 ) + FONT.TF_SINGLELINE + FONT.TF_NOCLIP,
+					formatInfoSz = { 1, 1 },
+					color        = 0xFFFFFFFF,
+				},
+			},
+		},
+		layers = {
+			PLATE   = 0,
+			OVERLAY = 1,
+		},
+		hoverMix = 0,
+		isOver   = false,
+		lastOver = false,
+	}
+
+	function UI.Login_WelcomeBarBtn:BuildRuns( hm )
+		local uname = currentUsername()
+		if uname == "" then uname = "Pilot" end
+		return {
+			{ "Welcome, ",              TS.LerpColor( 0xFFD4DCE8, 0xFFF2F6FC, hm ), false },
+			{ uname,                    TS.LerpColor( 0xFFFFB424, 0xFFFFDF58, hm ), false },
+			{ "  |  ",                  0xFF6B778A,                                 false },
+			{ "Click here to change.",  TS.LerpColor( 0xFF88B5FF, 0xFFFFDA02, hm ), true  },
+		}
+	end
+
+	function UI.Login_WelcomeBarBtn:MeasureTotalWidth()
+		local hFont = safeFont( "Small" )
+		local runs = self:BuildRuns( 0 )
+		local totalW = 0
+		for _, r in ipairs( runs ) do
+			totalW = totalW + measureTextW( r[ 1 ], hFont )
+		end
+		return totalW, hFont
+	end
+
+	function UI.Login_WelcomeBarBtn:F_OnMouseIn()
+		self.isOver = true
+		if self.hoverTween then self.hoverTween:Cancel() end
+		self.hoverTween = TS:Create( self, TweenInfo.new( 0.09, "Quad", "Out" ), { hoverMix = 1 } )
+		if self.hoverTween then self.hoverTween:Play() end
+	end
+
+	function UI.Login_WelcomeBarBtn:F_OnMouseOut()
+		self.isOver = false
+		if self.hoverTween then self.hoverTween:Cancel() end
+		self.hoverTween = TS:Create( self, TweenInfo.new( 0.09, "Quad", "Out" ), { hoverMix = 0 } )
+		if self.hoverTween then self.hoverTween:Play() end
+	end
+
+	function UI.Login_WelcomeBarBtn:F_OnMouseLButtonDown( mouseX, mouseY )
+		demo.ExpandToForm( true, false )
+		return true
+	end
+
+	function UI.Login_WelcomeBarBtn:F_DrawLayer( x0, y0, width, height, clipX0, clipY0, clipW, clipH, layerIdx )
+		local overlayIdx = ( self.layers and self.layers.OVERLAY ) or 1
+		if layerIdx ~= overlayIdx then return end
+		local ok, err = pcall( function()
+			local layerAlpha = ( UI.GetAlpha and UI:GetAlpha( self:GetColor( overlayIdx ) ) or 255 ) / 255
+			if layerAlpha <= 0.005 then return end
+
+			local function applyAlpha( c )
+				if layerAlpha >= 0.999 or not UI.GetAlpha or not UI.SetAlpha then return c end
+				return UI:SetAlpha( c, math.floor( UI:GetAlpha( c ) * layerAlpha + 0.5 ) )
+			end
+
+			local hm = self.hoverMix or 0
+			local hFont = safeFont( "Small" )
+			if not hFont or hFont == FONT.INVALID_FONT_HANDLE then return end
+
+			local runs = self:BuildRuns( hm )
+			local widths, totalW = {}, 0
+			for i, r in ipairs( runs ) do
+				local w = measureTextW( r[ 1 ], hFont )
+				widths[ i ] = w
+				totalW = totalW + w
+			end
+
+			local padX  = SX( 12 )
+			local pillW = math.min( width, totalW + padX * 2 )
+			local pillX = x0 + ( width - pillW ) * 0.5
+			local px    = UI:XToRel( 1 )
+			local py    = UI:YToRel( 1 )
+
+			local curX  = x0 + ( width - totalW ) * 0.5
+			local linkX, linkW = curX, 0
+			for i, r in ipairs( runs ) do
+				if r[ 3 ] then linkX, linkW = curX, widths[ i ] end
+				curX = curX + widths[ i ]
+			end
+
+			-- 1. All sprite graphics: pill background, top/bottom accent hairlines, and underline
+			local hTex = UI:GetTex( "white" )
+			if UI.drawer and UI.drawer.DrawImagedRect and hTex and hTex ~= UI.INVALID_RESOURCE_HANDLE then
+				local bgCol   = applyAlpha( TS.LerpColor( 0x7206080E, 0xAA0C1322, hm ) )
+				local lineCol = applyAlpha( TS.LerpColor( 0x356480A6, 0x98FFBA24, hm ) )
+				local ulCol   = applyAlpha( TS.LerpColor( 0x4888B5FF, 0xECFFDA02, hm ) )
+				local ulW     = linkW * ( 0.85 + 0.15 * hm )
+				local ulX     = linkX + ( linkW - ulW ) * 0.5
+
+				UI.drawer:DrawImagedRect( pillX, y0, pillW, height, clipX0, clipY0, clipW, clipH, hTex, bgCol, 0, 0, 1, 1, false )
+				UI.drawer:DrawImagedRect( pillX, y0, pillW, py, clipX0, clipY0, clipW, clipH, hTex, lineCol, 0, 0, 1, 1, false )
+				UI.drawer:DrawImagedRect( pillX, y0 + height - py, pillW, py, clipX0, clipY0, clipW, clipH, hTex, lineCol, 0, 0, 1, 1, false )
+				UI.drawer:DrawImagedRect( ulX, y0 + height - py * 3, ulW, py, clipX0, clipY0, clipW, clipH, hTex, ulCol, 0, 0, 1, 1, false )
+			end
+
+			-- 2. Flush sprite batch, render multi-run colored text, and restore drawer batch
+			if not _G.UI_DrawText then return end
+			local flags = FONT.TF_LEFT + FONT.TF_VCENTER + FONT.TF_SINGLELINE + FONT.TF_NOCLIP
+			curX = x0 + ( width - totalW ) * 0.5
+
+			UI.drawer:EndUiDrawing()
+			for i, r in ipairs( runs ) do
+				local str, col = r[ 1 ], r[ 2 ]
+				local w = widths[ i ]
+				_G.UI_DrawText( str, hFont, UI:Quat( curX, y0, w + px * 2, height ), applyAlpha( col ), 0, flags, UI:Quat( clipX0, clipY0, clipW, clipH ) )
+				curX = curX + w
+			end
+			UI.drawer:BeginUiDrawing()
+		end )
+		if not ok then log( "WelcomeBar DrawLayer error: %s", tostring( err ) ) end
+	end
+
+	local function ensureWelcomeBar()
+		local wnd = UI.Login_WelcomeBarBtn
+		if not wnd or not wnd.w or not wnd.IsChildOf then
+			if UI.CreateWndFromTable then
+				local created = UI:CreateWndFromTable( "UI.Login_WelcomeBarBtn" )
+				if created then
+					UI.Login_WelcomeBarBtn = created
+					wnd = created
+				end
+			end
+		end
+		return wnd
+	end
+
+	-- -------------------------------------------------------------------------
+	-- Background Zoom & Color State
+	-- -------------------------------------------------------------------------
 	local function setBgState( s, col )
 		local px, py = 512 * ( 1 - s ), 384 * ( 1 - s )
 		for _, layer in ipairs( { LW.layers.BG_EFFECT, LW.layers.BG2_EFFECT } ) do
@@ -84,11 +294,9 @@ do
 		end,
 	}
 
-	-- The main effect's links, read from LoginWnd's own def:
-	--   demo.wndLinks[ "UI.Login_OptionsBtn" ] = { objName = "btn_2_3", params = POS }
-	--   demo.layerLinks[ layerIdx ]            = { objName = "version1", params = ... }
-	-- Must run at script load: the engine drops UI.LoginWnd.def once the window is
-	-- built (reading it later fails with "attempt to index field 'def' (a nil value)").
+	-- -------------------------------------------------------------------------
+	-- Locator Links Capture (must run at script load while LoginWnd.def exists)
+	-- -------------------------------------------------------------------------
 	local function readLinks()
 		demo.wndLinks, demo.layerLinks = {}, {}
 		local def = rawget( LW, "def" )
@@ -113,12 +321,12 @@ do
 
 	local function unlinkWnd( name, w )
 		local eff = mainEffect()
-		if eff and demo.wndLinks[ name ] then eff:UnlinkWnd( w:GetUiHandle(), "" ) end
+		if eff and demo.wndLinks[ name ] and w and w.w then eff:UnlinkWnd( w:GetUiHandle(), "" ) end
 	end
 
 	local function relinkWnd( name, w )
 		local eff, link = mainEffect(), demo.wndLinks[ name ]
-		if eff and link and w.w then eff:LinkWnd( w:GetUiHandle(), link.objName, link.params ) end
+		if eff and link and w and w.w then eff:LinkWnd( w:GetUiHandle(), link.objName, link.params ) end
 	end
 
 	local function track( tw )
@@ -126,6 +334,365 @@ do
 		return tw
 	end
 
+	local function trackAuth( tw )
+		if tw then demo.authTweens[ #demo.authTweens + 1 ] = tw; tw:Play() end
+		return tw
+	end
+
+	local function cancelAuthTweens()
+		for _, tw in ipairs( demo.authTweens ) do
+			if tw.PlaybackState == "Playing" or tw.PlaybackState == "Delayed" then tw:Cancel() end
+		end
+		demo.authTweens = {}
+	end
+
+	-- -------------------------------------------------------------------------
+	-- Hover Scale Hook (for SIDE buttons and UI.Login_SteamLogInBtn)
+	-- -------------------------------------------------------------------------
+	local function hookHover( name, w, customScale, verticalLift )
+		if not w or w.__demoHover then return end
+		w.__demoHover = true
+		local scaleTarget = customScale or HOVER_SCALE
+		local prev = w.UpdateEffectAnimation
+		w.UpdateEffectAnimation = function( self, ... )
+			if prev then prev( self, ... ) end
+			if not demo.played or not self.__demoReady then return end
+			local eff = UI:GetEffectFromLayer( self, self.layers.MAIN_EFFECT )
+			if not eff then return end
+			local over = self:GetMouseState() ~= UI.MOUSE_OUT
+			local h = demo.hover[ self ]
+			if over and ( not h or h.back ) then
+				if not h then
+					unlinkWnd( name, self )
+					h = { x = self:GetLeft(), y = self:GetTop(), w = self:GetWidth(), h = self:GetHeight() }
+					demo.hover[ self ] = h
+				else
+					if h.backPos then h.backPos:Cancel() end
+					if h.backScale then h.backScale:Cancel() end
+					h.back = nil
+				end
+				local dx = verticalLift and 0 or ( h.w * ( scaleTarget - 1 ) * 0.5 )
+				local dy = verticalLift or ( h.h * ( scaleTarget - 1 ) * 0.5 )
+				local info = TweenInfo.new( HOVER_TIME, "Quad", "Out" )
+				h.twPos   = TS:Create( self, info, { Left = h.x - dx, Top = h.y - dy } )
+				h.twScale = TS:Create( eff,  info, { Scale = scaleTarget } )
+				h.twPos:Play()
+				h.twScale:Play()
+			elseif not over and h and not h.back then
+				h.back = true
+				local info = TweenInfo.new( HOVER_TIME, "Quad", "Out" )
+				h.backPos   = TS:Create( self, info, { Left = h.x, Top = h.y } )
+				h.backScale = TS:Create( eff,  info, { Scale = 1 } )
+				h.backPos.Completed:Connect( function( state )
+					if state == "Completed" and demo.hover[ self ] == h then
+						demo.hover[ self ] = nil
+						TS:Set( eff, { Scale = 1 } )
+						relinkWnd( name, self )
+					end
+				end )
+				h.backPos:Play()
+				h.backScale:Play()
+			elseif not over and not h then
+				local curScale = eff:GetScale()
+				if curScale and ( math.abs( curScale.x - 1 ) > 0.01 or math.abs( curScale.y - 1 ) > 0.01 ) then
+					eff:SetScale( UI:Vec2( 1, 1 ) )
+				end
+			end
+		end
+	end
+
+	-- -------------------------------------------------------------------------
+	-- Golden Play Button & Welcome Bar Layout + Mounting Helpers
+	-- -------------------------------------------------------------------------
+	function demo.GetPlayBtnRestRect()
+		local btn = UI.Login_SteamLogInBtn
+		local bx = btn and btn.w and btn:GetLeft() or 0
+		local by = btn and btn.w and btn:GetTop() or 0
+		local bw = btn and btn.w and btn:GetWidth() or 0
+		local bh = btn and btn.w and btn:GetHeight() or 0
+		if bw <= 10 or bh <= 8 then
+			bw = SX( 150 )
+			bh = SY( 40 )
+		end
+		if bx <= 0 or by <= 0 then
+			bx = 512 - bw * 0.5
+			by = SY( 603.127 )
+		end
+		return bx, by, bw, bh
+	end
+
+	function demo.UpdateWelcomeBarLayout( refBx, refBy, refBw, refBh )
+		local wb = ensureWelcomeBar()
+		if not wb or not wb.w then return 0, 0, 0, 0 end
+		local bx, by, bw, bh = refBx, refBy, refBw, refBh
+		if not bx then
+			if demo.playBtnRest then
+				bx, by, bw, bh = demo.playBtnRest[ 1 ], demo.playBtnRest[ 2 ], demo.playBtnRest[ 3 ], demo.playBtnRest[ 4 ]
+			else
+				bx, by, bw, bh = demo.GetPlayBtnRestRect()
+			end
+		end
+		local textW = wb:MeasureTotalWidth()
+		local ww = math.max( bw + SX( 110 ), textW + SX( 28 ) )
+		local wh = SY( 22 )
+		local wx = ( bx + bw * 0.5 ) - ww * 0.5
+		local wy = by + bh + SY( 6 )
+		wb:SetLeft( wx )
+		wb:SetTop( wy )
+		wb:SetWidth( ww )
+		wb:SetHeight( wh )
+		demo.welcomeRest = { wx, wy, ww, wh }
+		return wx, wy, ww, wh
+	end
+
+	local function mountFormControls( show )
+		if show then
+			LW:AddControl( UI.Login_AccountEditWnd,  LW.layers.ACCOUNT_EFFECT,  LW.effectInfo.account.editWndLocator )
+			LW:AddControl( UI.Login_PasswordEditWnd, LW.layers.PASSWORD_EFFECT, LW.effectInfo.password.editWndLocator )
+			LW:AddControl( UI.Login_RememberCheckBox, LW.layers.MAIN_EFFECT,    LW.effectInfo.main.rememberCheckBoxLocator )
+			LW:AddControl( UI.Login_LogInBtn,         LW.layers.MAIN_EFFECT,    LW.effectInfo.main.logInBtnLocator )
+			LW:SetLayerVisible( true, LW.layers.ACCOUNT_LABEL )
+			LW:SetLayerVisible( true, LW.layers.PASSWORD_LABEL )
+			for _, layer in ipairs( { LW.layers.ACCOUNT_EFFECT, LW.layers.PASSWORD_EFFECT } ) do
+				local eff = UI:GetEffectFromLayer( LW, layer )
+				if eff then TS:Set( eff, { Transparency = 0 } ) end
+			end
+			for _, name in ipairs( FORM_FIELDS ) do
+				local w = wndAny( name )
+				if w then TS:Set( w, { Transparency = 0 } ) end
+			end
+		else
+			LW:RemoveControl( UI.Login_AccountEditWnd,   LW.layers.ACCOUNT_EFFECT )
+			LW:RemoveControl( UI.Login_PasswordEditWnd,  LW.layers.PASSWORD_EFFECT )
+			LW:RemoveControl( UI.Login_ForgetBtn,        LW.layers.MAIN_EFFECT )
+			LW:RemoveControl( UI.Login_RegisterBtn,      LW.layers.MAIN_EFFECT )
+			LW:RemoveControl( UI.Login_RememberCheckBox, LW.layers.MAIN_EFFECT )
+			LW:RemoveControl( UI.Login_LogInBtn,         LW.layers.MAIN_EFFECT )
+			LW:SetLayerVisible( false, LW.layers.ACCOUNT_LABEL )
+			LW:SetLayerVisible( false, LW.layers.PASSWORD_LABEL )
+		end
+	end
+
+	local function mountQuickPlayControls( show )
+		local playBtn = UI.Login_SteamLogInBtn
+		local wb = ensureWelcomeBar()
+		if show then
+			if playBtn and playBtn.w then
+				demo.hover[ playBtn ] = nil
+				local eff = UI:GetEffectFromLayer( playBtn, playBtn.layers.MAIN_EFFECT )
+				if eff then TS:Set( eff, { Scale = 1 } ) end
+				LW:AddControl( playBtn, LW.layers.MAIN_EFFECT, LW.effectInfo.main.steamLogInBtnLocator )
+				playBtn:SetText( "Play", playBtn.layers.TEXT )
+				playBtn:Enable( LW.waitMode == LW.waitModes.NONE )
+				if playBtn.UpdateEffectAnimation then playBtn:UpdateEffectAnimation() end
+				hookHover( "UI.Login_SteamLogInBtn", playBtn, PLAY_HOVER_SCL, PLAY_HOVER_LIFT )
+				local bx, by, bw, bh = demo.GetPlayBtnRestRect()
+				demo.playBtnRest = { bx, by, bw, bh }
+			end
+			if wb and wb.w then
+				if not wb:IsChildOf( LW ) then LW:AddChild( wb ) end
+				demo.UpdateWelcomeBarLayout()
+			end
+		else
+			if playBtn and playBtn.w then
+				demo.hover[ playBtn ] = nil
+				local eff = UI:GetEffectFromLayer( playBtn, playBtn.layers.MAIN_EFFECT )
+				if eff then TS:Set( eff, { Scale = 1 } ) end
+				playBtn:SetText( "^login_btnLogin", playBtn.layers.TEXT )
+				LW:RemoveControl( playBtn, LW.layers.MAIN_EFFECT )
+			end
+			if wb and wb.w and wb:IsChildOf( LW ) then
+				wb:UnlinkFromParent()
+			end
+		end
+	end
+
+	local function hasRememberedAccount()
+		if LW:IsSteamAccount() or LW:IsArcAccount() then return false end
+		local cb = UI.Login_RememberCheckBox
+		local checked = cb and cb.IsChecked and cb:IsChecked()
+		local acc = currentUsername()
+		return ( checked and acc ~= "" ) and true or false
+	end
+
+	-- -------------------------------------------------------------------------
+	-- Minimize Form -> Golden Play Button + Welcome Bar
+	-- -------------------------------------------------------------------------
+	function demo.MinimizeToPlayBtn( animated )
+		if LW:IsSteamAccount() or LW:IsArcAccount() then return end
+		cancelAuthTweens()
+		demo.isMinimized     = true
+		demo.pendingMinimize = false
+		LW:ResetFocus()
+
+		local playBtn = UI.Login_SteamLogInBtn
+		local wb      = ensureWelcomeBar()
+
+		if not animated then
+			mountFormControls( false )
+			mountQuickPlayControls( true )
+			local tr = demo.played and 0 or 1
+			if playBtn and playBtn.w then
+				playBtn.__demoReady = demo.played
+				TS:Set( playBtn, { Transparency = tr } )
+				if demo.played then
+					relinkWnd( "UI.Login_SteamLogInBtn", playBtn )
+				else
+					unlinkWnd( "UI.Login_SteamLogInBtn", playBtn )
+				end
+				playBtn:SetText( "Play", playBtn.layers.TEXT )
+			end
+			if wb and wb.w then
+				TS:Set( wb, { Transparency = tr } )
+			end
+			LW:UpdateLogInBtn()
+			return
+		end
+
+		-- 1. Smoothly fade & collapse out the form controls
+		for _, layer in ipairs( { LW.layers.ACCOUNT_EFFECT, LW.layers.PASSWORD_EFFECT } ) do
+			local eff = UI:GetEffectFromLayer( LW, layer )
+			if eff then
+				trackAuth( TS:Create( eff, TweenInfo.new( 0.18, "Quad", "In" ), { Transparency = 1 } ) )
+			end
+		end
+		LW:SetLayerVisible( false, LW.layers.ACCOUNT_LABEL )
+		LW:SetLayerVisible( false, LW.layers.PASSWORD_LABEL )
+
+		for _, name in ipairs( FORM_FIELDS ) do
+			local w = wndByName( name )
+			if w then
+				unlinkWnd( name, w )
+				local y = w:GetTop()
+				trackAuth( TS:Create( w, TweenInfo.new( 0.18, "Quad", "In" ), { Top = y + SY( 10 ), Transparency = 1 } ) )
+			end
+		end
+
+		-- 2. Mount Golden Play Button & Welcome Bar, then slide down + fade in
+		mountQuickPlayControls( true )
+		LW:UpdateLogInBtn()
+
+		if playBtn and playBtn.w then
+			playBtn.__demoReady = false
+			local bx, by, bw, bh = demo.GetPlayBtnRestRect()
+			demo.playBtnRest = { bx, by, bw, bh }
+			unlinkWnd( "UI.Login_SteamLogInBtn", playBtn )
+			playBtn:SetText( "Play", playBtn.layers.TEXT )
+
+			TS:Set( playBtn, { Left = bx, Top = by - SY( 24 ), Transparency = 1 } )
+
+			local slidePlay = trackAuth( TS:Create( playBtn, TweenInfo.new( 0.42, "Back", "Out", 0, false, 0.08 ), { Top = by } ) )
+			trackAuth( TS:Create( playBtn, TweenInfo.new( 0.28, "Sine", "Out", 0, false, 0.08 ), { Transparency = 0 } ) )
+			if slidePlay then
+				slidePlay.Completed:Connect( function( state )
+					if demo.isMinimized then
+						playBtn.__demoReady = true
+						relinkWnd( "UI.Login_SteamLogInBtn", playBtn )
+						playBtn:SetText( "Play", playBtn.layers.TEXT )
+						mountFormControls( false )
+					end
+				end )
+			end
+		end
+
+		if wb and wb.w then
+			local wx, wy = demo.UpdateWelcomeBarLayout()
+			TS:Set( wb, { Left = wx, Top = wy - SY( 14 ), Transparency = 1 } )
+			trackAuth( TS:Create( wb, TweenInfo.new( 0.38, "Cubic", "Out", 0, false, 0.15 ), { Top = wy } ) )
+			trackAuth( TS:Create( wb, TweenInfo.new( 0.28, "Sine",  "Out", 0, false, 0.15 ), { Transparency = 0 } ) )
+		end
+	end
+
+	-- -------------------------------------------------------------------------
+	-- Expand Back to E-mail / Password Form ("Click here to change.")
+	-- -------------------------------------------------------------------------
+	function demo.ExpandToForm( animated, focusPassword )
+		if LW:IsSteamAccount() or LW:IsArcAccount() then return end
+		cancelAuthTweens()
+		demo.isMinimized     = false
+		demo.pendingMinimize = false
+
+		if UI.Login_RememberCheckBox and UI.Login_RememberCheckBox.Check then
+			UI.Login_RememberCheckBox:Check( false )
+		end
+		pcall( function() LW:ClearSavedAuthorizationData() end )
+
+		local playBtn = UI.Login_SteamLogInBtn
+		local wb      = UI.Login_WelcomeBarBtn
+
+		if not animated then
+			mountQuickPlayControls( false )
+			mountFormControls( true )
+			LW:UpdateLogInBtn()
+			LW:UpdateFocus()
+			return
+		end
+
+		-- 1. Slide up & fade out the Golden Play Button and Welcome Bar
+		if playBtn and playBtn.w and playBtn:IsChildOf( LW ) then
+			playBtn.__demoReady = false
+			demo.hover[ playBtn ] = nil
+			unlinkWnd( "UI.Login_SteamLogInBtn", playBtn )
+			local by = playBtn:GetTop()
+			local hidePlay = trackAuth( TS:Create( playBtn, TweenInfo.new( 0.18, "Quad", "In" ), { Top = by - SY( 18 ), Transparency = 1 } ) )
+			if hidePlay then
+				hidePlay.Completed:Connect( function()
+					if not demo.isMinimized then mountQuickPlayControls( false ) end
+				end )
+			end
+		end
+		if wb and wb.w and wb:IsChildOf( LW ) then
+			local wy = wb:GetTop()
+			trackAuth( TS:Create( wb, TweenInfo.new( 0.16, "Quad", "In" ), { Top = wy - SY( 12 ), Transparency = 1 } ) )
+		end
+
+		-- 2. Mount and slide down / fade in the E-mail & Password form
+		mountFormControls( true )
+		LW:UpdateLogInBtn()
+
+		for _, layer in ipairs( { LW.layers.ACCOUNT_EFFECT, LW.layers.PASSWORD_EFFECT } ) do
+			local eff = UI:GetEffectFromLayer( LW, layer )
+			if eff then
+				TS:Set( eff, { Transparency = 1 } )
+				trackAuth( TS:Create( eff, TweenInfo.new( 0.28, "Cubic", "Out", 0, false, 0.10 ), { Transparency = 0 } ) )
+			end
+		end
+
+		for i, name in ipairs( FORM_FIELDS ) do
+			local w = wndByName( name )
+			if w then
+				relinkWnd( name, w )
+				local restY = w:GetTop()
+				local d = 0.08 + 0.025 * i
+				if name == "UI.Login_LogInBtn" or name == "UI.Login_RememberCheckBox" then
+					unlinkWnd( name, w )
+					TS:Set( w, { Top = restY - SY( 10 ), Transparency = 1 } )
+					local sl = trackAuth( TS:Create( w, TweenInfo.new( 0.28, "Cubic", "Out", 0, false, d ), { Top = restY } ) )
+					if sl then
+						sl.Completed:Connect( function()
+							if not demo.isMinimized then relinkWnd( name, w ) end
+						end )
+					end
+					trackAuth( TS:Create( w, TweenInfo.new( 0.24, "Sine", "Out", 0, false, d ), { Transparency = 0 } ) )
+				else
+					TS:Set( w, { Transparency = 1 } )
+					trackAuth( TS:Create( w, TweenInfo.new( 0.28, "Cubic", "Out", 0, false, d ), { Transparency = 0 } ) )
+				end
+			end
+		end
+
+		if focusPassword and UI.Login_PasswordEditWnd and UI.Login_PasswordEditWnd.w then
+			UI:SetKeyboardFocus( UI.Login_PasswordEditWnd:GetUiHandle() )
+		elseif UI.Login_AccountEditWnd and UI.Login_AccountEditWnd.w then
+			UI:SetKeyboardFocus( UI.Login_AccountEditWnd:GetUiHandle() )
+		else
+			LW:UpdateFocus()
+		end
+	end
+
+	-- -------------------------------------------------------------------------
+	-- Patch Name Pulse & Intro Boot Sequence
+	-- -------------------------------------------------------------------------
 	local function startPatchPulse( patch )
 		if demo.pulse then demo.pulse:Cancel() end
 		TS:Set( patch, { Color = WHITE } )
@@ -175,27 +742,69 @@ do
 			end
 		end
 
-		-- 2. login fields, Server Selector dock/controls, and slot backgrounds fade in shortly after
-		--    (capture child window base alphas before setting ACCOUNT_EFFECT / PASSWORD_EFFECT alpha to 0)
-		for i, name in ipairs( FIELDS ) do
-			local w = wndByName( name )
-			if w then
-				TS:Set( w, { Transparency = 1 } )
-				track( TS:Create( w, TweenInfo.new( 0.5, "Sine", "Out", 0, false, UI_START_DELAY + 0.15 + 0.04 * i ), { Transparency = 0 } ) )
+		-- 2. Authorization area: either Minimized Quick-Play (Golden Play Button + Welcome Bar)
+		--    or Expanded Form (Account, Password, Remember Me, Log In)
+		if demo.isMinimized then
+			mountFormControls( false )
+			mountQuickPlayControls( true )
+			local playBtn = UI.Login_SteamLogInBtn
+			local wb      = ensureWelcomeBar()
+			if playBtn and playBtn.w and playBtn:IsChildOf( LW ) then
+				playBtn.__demoReady = false
+				local bx, by, bw, bh = demo.GetPlayBtnRestRect()
+				demo.playBtnRest = { bx, by, bw, bh }
+				unlinkWnd( "UI.Login_SteamLogInBtn", playBtn )
+				playBtn:SetText( "Play", playBtn.layers.TEXT )
+
+				TS:Set( playBtn, { Left = bx, Top = by - SY( 26 ), Transparency = 1 } )
+				local eff = UI:GetEffectFromLayer( playBtn, playBtn.layers.MAIN_EFFECT )
+				if eff then eff:SetAlpha( 0 ) end
+				playBtn:SetColor( 0x00FFFFFF, playBtn.layers.TEXT )
+
+				-- Entrance staggered alongside menu items, dropping in last
+				local d = UI_START_DELAY + 0.48
+				local sl = track( TS:Create( playBtn, TweenInfo.new( 0.48, "Back", "Out", 0, false, d ), { Top = by } ) )
+				track( TS:Create( playBtn, TweenInfo.new( 0.32, "Sine", "Out", 0, false, d ), { Transparency = 0 } ) )
+				if sl then
+					sl.Completed:Connect( function()
+						if demo.isMinimized then
+							playBtn.__demoReady = true
+							relinkWnd( "UI.Login_SteamLogInBtn", playBtn )
+							playBtn:SetText( "Play", playBtn.layers.TEXT )
+						end
+					end )
+				end
+			end
+			if wb and wb.w and wb:IsChildOf( LW ) then
+				local wx, wy = demo.UpdateWelcomeBarLayout()
+				TS:Set( wb, { Left = wx, Top = wy - SY( 14 ), Transparency = 1 } )
+				local d = UI_START_DELAY + 0.60
+				track( TS:Create( wb, TweenInfo.new( 0.40, "Cubic", "Out", 0, false, d ), { Top = wy } ) )
+				track( TS:Create( wb, TweenInfo.new( 0.30, "Sine",  "Out", 0, false, d ), { Transparency = 0 } ) )
+			end
+		else
+			for i, name in ipairs( FORM_FIELDS ) do
+				local w = wndByName( name )
+				if w then
+					TS:Set( w, { Transparency = 1 } )
+					track( TS:Create( w, TweenInfo.new( 0.5, "Sine", "Out", 0, false, UI_START_DELAY + 0.15 + 0.04 * i ), { Transparency = 0 } ) )
+				end
+			end
+			for _, layer in ipairs( { LW.layers.ACCOUNT_EFFECT, LW.layers.PASSWORD_EFFECT } ) do
+				local eff = UI:GetEffectFromLayer( LW, layer )
+				if eff then
+					TS:Set( eff, { Transparency = 1 } )
+					track( TS:Create( eff, TweenInfo.new( 0.5, "Sine", "Out", 0, false, UI_START_DELAY + 0.15 ), { Transparency = 0 } ) )
+				end
 			end
 		end
+
+		-- Server Selector dock/controls fade in
 		for i, name in ipairs( SERVER_UI ) do
 			local w = wndByName( name )
 			if w then
 				TS:Set( w, { Transparency = 1 } )
 				track( TS:Create( w, TweenInfo.new( 0.5, "Sine", "Out", 0, false, UI_START_DELAY + 0.12 + 0.03 * i ), { Transparency = 0 } ) )
-			end
-		end
-		for _, layer in ipairs( { LW.layers.ACCOUNT_EFFECT, LW.layers.PASSWORD_EFFECT } ) do
-			local eff = UI:GetEffectFromLayer( LW, layer )
-			if eff then
-				TS:Set( eff, { Transparency = 1 } )
-				track( TS:Create( eff, TweenInfo.new( 0.5, "Sine", "Out", 0, false, UI_START_DELAY + 0.15 ), { Transparency = 0 } ) )
 			end
 		end
 
@@ -229,6 +838,7 @@ do
 			if tw.PlaybackState == "Playing" or tw.PlaybackState == "Delayed" then tw:Cancel() end
 		end
 		demo.tweens = {}
+		cancelAuthTweens()
 		TS:CancelAll( demo.bg )
 		TS:Set( demo.bg, { Scale = 1, Color = WHITE } )
 
@@ -253,17 +863,44 @@ do
 				relinkWnd( name, w )
 			end
 		end
-		for _, name in ipairs( FIELDS ) do
-			local w = wndByName( name )
-			if w then TS:CancelAll( w ); TS:Set( w, { Transparency = 0 } ) end
+
+		if demo.isMinimized then
+			mountFormControls( false )
+			mountQuickPlayControls( true )
+			local playBtn = UI.Login_SteamLogInBtn
+			if playBtn and playBtn.w then
+				playBtn.__demoReady = true
+				TS:CancelAll( playBtn )
+				local eff = UI:GetEffectFromLayer( playBtn, playBtn.layers.MAIN_EFFECT )
+				if eff then TS:CancelAll( eff ); TS:Set( eff, { Scale = 1 } ) end
+				TS:Set( playBtn, { Transparency = 0 } )
+				relinkWnd( "UI.Login_SteamLogInBtn", playBtn )
+				playBtn:SetText( "Play", playBtn.layers.TEXT )
+				local bx, by, bw, bh = demo.GetPlayBtnRestRect()
+				demo.playBtnRest = { bx, by, bw, bh }
+			end
+			local wb = UI.Login_WelcomeBarBtn
+			if wb and wb.w then
+				TS:CancelAll( wb )
+				TS:Set( wb, { Transparency = 0 } )
+				demo.UpdateWelcomeBarLayout()
+			end
+		else
+			mountQuickPlayControls( false )
+			mountFormControls( true )
+			for _, name in ipairs( FORM_FIELDS ) do
+				local w = wndByName( name )
+				if w then TS:CancelAll( w ); TS:Set( w, { Transparency = 0 } ); relinkWnd( name, w ) end
+			end
+			for _, layer in ipairs( { LW.layers.ACCOUNT_EFFECT, LW.layers.PASSWORD_EFFECT } ) do
+				local eff = UI:GetEffectFromLayer( LW, layer )
+				if eff then TS:CancelAll( eff ); TS:Set( eff, { Transparency = 0 } ) end
+			end
 		end
+
 		for _, name in ipairs( SERVER_UI ) do
 			local w = wndByName( name )
 			if w then TS:CancelAll( w ); TS:Set( w, { Transparency = 0 } ) end
-		end
-		for _, layer in ipairs( { LW.layers.ACCOUNT_EFFECT, LW.layers.PASSWORD_EFFECT } ) do
-			local eff = UI:GetEffectFromLayer( LW, layer )
-			if eff then TS:CancelAll( eff ); TS:Set( eff, { Transparency = 0 } ) end
 		end
 		if LW.layers.PATCH_NAME and demo.layerLinks[ LW.layers.PATCH_NAME ] then
 			local patch = TS:Layer( LW, LW.layers.PATCH_NAME )
@@ -274,68 +911,143 @@ do
 		demo.hover = {}
 	end
 
-	-- hover grow for the side buttons: unlinked only while hovered or easing back
-	local function hookHover( name, w )
-		if w.__demoHover then return end
-		w.__demoHover = true
-		local prev = w.UpdateEffectAnimation
-		w.UpdateEffectAnimation = function( self, ... )
-			if prev then prev( self, ... ) end
-			if not demo.played or not self.__demoReady then return end
-			local eff = UI:GetEffectFromLayer( self, self.layers.MAIN_EFFECT )
-			if not eff then return end
-			local over = self:GetMouseState() ~= UI.MOUSE_OUT
-			local h = demo.hover[ self ]
-			if over and ( not h or h.back ) then
-				if not h then
-					unlinkWnd( name, self )
-					h = { x = self:GetLeft(), y = self:GetTop(), w = self:GetWidth(), h = self:GetHeight() }
-					demo.hover[ self ] = h
+	-- -------------------------------------------------------------------------
+	-- Hooks on UI.LoginWnd for Quick-Play / Remember Me Integration
+	-- -------------------------------------------------------------------------
+	local prevUpdateAuth = LW.UpdateAuthorizationControls
+	LW.UpdateAuthorizationControls = function( self, ... )
+		if prevUpdateAuth then prevUpdateAuth( self, ... ) end
+		if not self:IsSteamAccount() and not self:IsArcAccount() then
+			if hasRememberedAccount() then
+				if demo.played then
+					demo.MinimizeToPlayBtn( false )
 				else
-					if h.backPos then h.backPos:Cancel() end
-					if h.backScale then h.backScale:Cancel() end
-					h.back = nil
+					demo.isMinimized = true
 				end
-				local dx = h.w * ( HOVER_SCALE - 1 ) * 0.5
-				local dy = h.h * ( HOVER_SCALE - 1 ) * 0.5
-				local info = TweenInfo.new( HOVER_TIME, "Quad", "Out" )
-				h.twPos   = TS:Create( self, info, { Left = h.x - dx, Top = h.y - dy } )
-				h.twScale = TS:Create( eff,  info, { Scale = HOVER_SCALE } )
-				h.twPos:Play()
-				h.twScale:Play()
-			elseif not over and h and not h.back then
-				h.back = true
-				local info = TweenInfo.new( HOVER_TIME, "Quad", "Out" )
-				h.backPos   = TS:Create( self, info, { Left = h.x, Top = h.y } )
-				h.backScale = TS:Create( eff,  info, { Scale = 1 } )
-				h.backPos.Completed:Connect( function( state )
-					if state == "Completed" and demo.hover[ self ] == h then
-						demo.hover[ self ] = nil
-						TS:Set( eff, { Scale = 1 } )
-						relinkWnd( name, self )
-					end
-				end )
-				h.backPos:Play()
-				h.backScale:Play()
+			else
+				demo.isMinimized = false
+				mountQuickPlayControls( false )
 			end
 		end
 	end
 
-	-- drive TweenService from the login window and start the intro on its first frame
+	local prevRestoreUiState = LW.RestoreUiState
+	LW.RestoreUiState = function( self, ... )
+		if prevRestoreUiState then prevRestoreUiState( self, ... ) end
+		if not self:IsSteamAccount() and not self:IsArcAccount() then
+			if hasRememberedAccount() then
+				if demo.played then
+					demo.MinimizeToPlayBtn( false )
+				else
+					demo.isMinimized = true
+				end
+			else
+				demo.isMinimized = false
+				mountQuickPlayControls( false )
+			end
+		end
+	end
+
+	local prevUpdateLogInBtn = LW.UpdateLogInBtn
+	LW.UpdateLogInBtn = function( self, ... )
+		if prevUpdateLogInBtn then prevUpdateLogInBtn( self, ... ) end
+		if demo.isMinimized and UI.Login_SteamLogInBtn and UI.Login_SteamLogInBtn.w then
+			-- Keep the Golden Play Button bright, clickable, and labeled "Play" in Quick-Play mode
+			UI.Login_SteamLogInBtn:Enable( self.waitMode == self.waitModes.NONE )
+			UI.Login_SteamLogInBtn:SetText( "Play", UI.Login_SteamLogInBtn.layers.TEXT )
+		end
+	end
+
+	local prevOnRemember = LW.OnRememberAccount
+	LW.OnRememberAccount = function( self, ... )
+		if prevOnRemember then prevOnRemember( self, ... ) end
+		local cb = UI.Login_RememberCheckBox
+		if cb and cb.IsChecked and cb:IsChecked() then
+			if currentUsername() ~= "" then
+				self:SaveAuthorizationData()
+				demo.MinimizeToPlayBtn( true )
+			else
+				demo.pendingMinimize = true
+			end
+		else
+			demo.pendingMinimize = false
+		end
+	end
+
+	local prevOnLogIn = LW.OnLogIn
+	LW.OnLogIn = function( self, ... )
+		if demo.isMinimized and not self:IsUsingSteamAccount() and not self:IsUsingArcAccount() then
+			local status = self:GetLoginStatus()
+			if status == self.loginStatuses.EMPTY_PASSWORD then
+				demo.ExpandToForm( true, true )
+				return
+			elseif status == self.loginStatuses.EMPTY_ACCOUNT then
+				demo.ExpandToForm( true, false )
+				return
+			end
+		end
+		if not self:IsUsingSteamAccount() and not self:IsUsingArcAccount() then
+			if UI.Login_RememberCheckBox and UI.Login_RememberCheckBox.IsChecked and UI.Login_RememberCheckBox:IsChecked() then
+				self:SaveAuthorizationData()
+			end
+		end
+		if prevOnLogIn then return prevOnLogIn( self, ... ) end
+	end
+
+	local prevLButtonDown = LW.F_OnMouseLButtonDown
+	LW.F_OnMouseLButtonDown = function( self, mouseX, mouseY, wndThatReceivedInput )
+		local wnd = UI:GetUiObjByHandleT( wndThatReceivedInput )
+		if wnd and UI.Login_WelcomeBarBtn and ( wnd == UI.Login_WelcomeBarBtn or ( wnd.IsChildOf and wnd:IsChildOf( UI.Login_WelcomeBarBtn ) ) ) then
+			demo.ExpandToForm( true, false )
+			return true
+		end
+		if prevLButtonDown then return prevLButtonDown( self, mouseX, mouseY, wndThatReceivedInput ) end
+		return false
+	end
+
+	-- If user checked "Remember me" before typing their username, auto-minimize once
+	-- they finish typing and leave the edit box
+	for _, editKey in ipairs( { "Login_AccountEditWnd", "Login_PasswordEditWnd" } ) do
+		local ew = UI[ editKey ]
+		if ew then
+			local prevLost = ew.F_OnLostKeyboardFocus
+			ew.F_OnLostKeyboardFocus = function( self, ... )
+				if prevLost then prevLost( self, ... ) end
+				if demo.pendingMinimize and not demo.isMinimized then
+					local acc = currentUsername()
+					local pass = ( UI.Login_PasswordEditWnd and UI.Login_PasswordEditWnd.GetEditText and UI.Login_PasswordEditWnd:GetEditText() ) or ""
+					if acc ~= "" and pass ~= "" then
+						LW:SaveAuthorizationData()
+						demo.MinimizeToPlayBtn( true )
+					end
+				end
+			end
+		end
+	end
+
+	-- -------------------------------------------------------------------------
+	-- Frame Tick, Hover Poll for WelcomeBarBtn, and Lifecycle Hooks
+	-- -------------------------------------------------------------------------
 	TS:Attach( LW )
 	local prevFrame = LW.F_OnNewFrame
 	local function start()
+		if not LW:IsSteamAccount() and not LW:IsArcAccount() and hasRememberedAccount() then
+			demo.isMinimized = true
+		end
 		demo.PlayIntro()
 		for _, name in ipairs( SIDE ) do
 			local w = wndByName( name )
-			if w then hookHover( name, w ) end
+			if w then hookHover( name, w, HOVER_SCALE ) end
+		end
+		if UI.Login_SteamLogInBtn and UI.Login_SteamLogInBtn.w then
+			hookHover( "UI.Login_SteamLogInBtn", UI.Login_SteamLogInBtn, PLAY_HOVER_SCL, PLAY_HOVER_LIFT )
 		end
 	end
+
 	LW.F_OnNewFrame = function( self, hSender, dt_sys, dt_game )
-		-- the login's own frame logic (server status, timers) always runs first
 		if prevFrame then prevFrame( self, hSender, dt_sys, dt_game ) end
 		if not demo.played then
-			demo.played = true      -- never retried every frame if something fails
+			demo.played = true
 			local ok, err = pcall( start )
 			if not ok then log( "intro failed: %s", tostring( err ) ) end
 		elseif demo.screen and ( demo.screen[ 1 ] ~= UI.screenWidth or demo.screen[ 2 ] ~= UI.screenHeight ) then
@@ -343,9 +1055,21 @@ do
 			local ok, err = pcall( demo.SnapToLinks )
 			if not ok then log( "resize handling failed: %s", tostring( err ) ) end
 		end
+
+		-- Poll hover state on UI.Login_WelcomeBarBtn for smooth hover transitions
+		local wb = UI.Login_WelcomeBarBtn
+		if demo.isMinimized and wb and wb.w and wb:IsOnScreen() then
+			local over = wb.isOver or ( wb.GetMouseState and wb:GetMouseState() ~= UI.MOUSE_OUT ) or false
+			if over ~= wb.lastOver then
+				wb.lastOver = over
+				if wb.hoverTween then wb.hoverTween:Cancel() end
+				wb.hoverTween = TS:Create( wb, TweenInfo.new( 0.09, "Quad", "Out" ), { hoverMix = over and 1 or 0 } )
+				if wb.hoverTween then wb.hoverTween:Play() end
+			end
+		end
 	end
 
-	-- sync owner-drawn warningMetaText ("Retrieving server list") with the WARNING layer's alpha
+	-- Sync owner-drawn warningMetaText ("Retrieving server list") with the WARNING layer's alpha
 	local prevDrawLayer = LW.F_DrawLayer
 	LW.F_DrawLayer = function( self, x0, y0, width, height, clipX0, clipY0, clipWidth, clipHeight, layerIdx )
 		if layerIdx == self.layers.WARNING and self.warningMetaText and self.warningMetaText.SetAlpha and UI.GetAlpha then
@@ -356,7 +1080,7 @@ do
 		if prevDrawLayer then return prevDrawLayer( self, x0, y0, width, height, clipX0, clipY0, clipWidth, clipHeight, layerIdx ) end
 	end
 
-	-- replay next time the login screen opens
+	-- Replay next time the login screen opens
 	local prevHide = LW.F_OnAfterHideFromScreen
 	LW.F_OnAfterHideFromScreen = function( self, ... )
 		if demo.played then pcall( demo.SnapToLinks ) end

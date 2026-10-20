@@ -29,17 +29,17 @@ The patcher manages two independent mods, each on its own tab under the diagnost
 | Tab | Mod | What it does |
 | :--- | :--- | :--- |
 | **Server Selector** | essential | Everything above: saving and switching community servers, telemetry header dock, and live resolution scaling |
-| **UI Overhaul** | flavor & comfort | Cinematic login boot sequence: fades in smoothly from pure black while the space background zooms out (`1.10x -> 1.00x`), then cascades in the UI chrome, login fields, Server Selector dock, and right-hand menu column; pulses the patch name between white and accent gold; scales menu buttons on hover. Built on **TweenService**, a Roblox-style animation and UI utility library in pure Lua 5.1 |
+| **UI Overhaul** | flavor & comfort | Cinematic login boot sequence (fade-from-black, background zoom-out, staggered UI cascade), classic golden MMO play button with "Remember Me" Quick-Play mode and dynamic Welcome Bar, button hover feedback, and Roblox-style UI toolkit (TweenService + RbxUI) |
 
 Install, update or remove either one without touching the other. **↺ Restore original** (next to the backup status) puts back `loginwnd.lua.orig` and removes every mod at once.
 
 ---
 
-## UI Overhaul & Roblox-Style Lua Utilities (`TweenService`)
+## UI Overhaul & Roblox-Style Lua Utilities (`TweenService` & `RbxUI`)
 
 ![Cinematic Login Boot Sequence](assets/cinematic_intro.gif)
 
-Star Conflict's native UI engine (`m3d` / Targem Lua 5.1) relies on static `.sanim` keyframe files and has no built-in procedural tweening or interpolation utilities beyond a single color lerp helper. To modernize the UI and make authoring rich, responsive menus straightforward, the **UI Overhaul** module introduces **Roblox-style UI utilities** directly into the game's Lua environment—starting with **`TweenService`**, **`TweenInfo`**, **`Enum`**, and **`RBXScriptSignal`-style events**.
+Star Conflict's native UI engine (`m3d` / Targem Lua 5.1) relies on static `.sanim` keyframe files and has no built-in procedural tweening or interpolation utilities beyond a single color lerp helper. To modernize the UI and make authoring rich, responsive menus straightforward, the **UI Overhaul** module introduces **Roblox-style UI utilities** directly into the game's Lua environment—bringing procedural animation, layout systems, styling constraints, and retained-mode GUI authoring to Star Conflict modding.
 
 ### Cinematic Login Screen (`ui_overhaul/login_tween_demo.lua`)
 - **Seamless Fade-In from Black**: Transitions smoothly from opaque black (`0xFF000000`) as `UI.LoginWnd` opens so the handoff from the initial loading screen (with the loading circle) is completely seamless and never leaks the underlying 3D scene behind the login canvas.
@@ -47,6 +47,24 @@ Star Conflict's native UI engine (`m3d` / Targem Lua 5.1) relies on static `.san
 - **Staggered UI Entrance**: After a brief beat (`0.35s`), fades in the top-left Star Conflict logo and bottom bar (`BG3_EFFECT`), status/version text layers, login fields, the Server Selector dock and action buttons, and cascades the right-hand menu column (`Back` / `Out`).
 - **Interactive Hover & Accent Pulse**: Right-hand menu items grow subtly (`1.04x`) from their center on mouse hover (`0.075s` `Quad` / `Out`), and the *"Legacy of the Precursors"* patch title continuously pulses between white and login accent gold (`0xFFFFD200`).
 - **Dynamic Resolution & Windowed Resize Support**: Widgets are unlinked from their `.sanim` locators only while actively animating and re-linked immediately on completion. If the game resolution or window size changes mid-animation (`1080p <-> 1440p`), both the Server Selector dock and `LoginTweenDemo` automatically recompute their layout and snap cleanly to the new coordinate system.
+
+### Classic Golden MMO Play Button & "Remember Me" Quick-Play Mode
+
+![Quick-Play Full End-to-End Showcase](assets/quickplay_showcase.gif)
+
+- **One-Click Quick Play**: When saved account credentials exist in your pilot profile (or when toggling "Remember me" on the login form), the form automatically minimizes into a clean **Quick-Play mode**.
+- **Golden MMO Play Button**: Restores the iconic gold play button (`UI.Login_SteamLogInBtn`, `login_enter_2.sanim`) from the classic MMO days of Star Conflict, relabeled with `"Play"` on the native gold text layer.
+- **Choreographed Boot Entrance ("Ideally Last")**: During the cinematic boot sequence from black, the Golden Play Button and Welcome Bar remain completely invisible while the space artwork zooms out and side buttons stagger in across the screen. The Golden Play Button drops in last at `0.83s` with a punchy bounce (`Back` / `Out`, `dy = -26 -> 0`), followed by the Welcome Bar at `0.95s` (`Cubic` / `Out`).
+- **Pure Vertical Hover Lift**: Hovering over the Golden Play button triggers a snappy vertical lift (`dy = -4px`, scale `1.05x`, `0.075s` `Quad` / `Out`) with pure vertical travel and zero diagonal drift.
+- **Dynamic Welcome Bar**: Displays `"Welcome, <Username> | Click here to change."` centered directly beneath the play button. Hovering over `"Click here to change."` highlights the text in gold with an active underline.
+- **Instant Account Switching**: Clicking `"Click here to change."` smoothly expands back to the full E-mail and Password form, clears stored credentials, and focuses the account field.
+- **Native Bottom Anchoring**: The Golden Play Button maintains dynamic anchoring to the engine's `enter_2` (`anchor "BC"`) locator, preserving pixel-perfect alignment across 1080p, 1440p, 4K, and ultrawide monitors.
+
+### What's New in v1.2.1
+- **Choreographed Quick-Play Boot Entrance**: The Golden Play Button and Welcome Bar are now completely hidden during the initial black fade-in and space zoom-out phase, dropping in last alongside the side menu buttons with a punchy bounce (`Back.Out`).
+- **Pure Vertical Hover Lift**: Refined the Golden Play Button hover animation to lift strictly upwards (`PLAY_HOVER_LIFT`), removing horizontal drift.
+- **Renderer Compatibility Fix**: Updated the Welcome Bar container to `Wnd` with `WLS_OWNERDRAW` text rendering, ensuring text and hover underlines render reliably in live `game.exe`.
+- **End-to-End Showcase Animation**: Added high-definition showcase GIF (`assets/quickplay_showcase.gif`) capturing the full sequence from pure black boot to interactive hover, form expansion, and remember-me re-check.
 
 ### `TweenService` API Overview (`ui_overhaul/tweenservice.lua`)
 Modelled directly after Roblox's `TweenService` API so scripts read naturally:
@@ -77,7 +95,30 @@ tween:Play() -- Also supports :Pause(), :Cancel(), :Destroy(), TweenService:Set(
 - **Windows (`UI.SomeWnd`)**: `Left`, `Top`, `Width`, `Height` (in Rel `1024x768` space), `Position` (`Vec2`), `Size` (`Vec2`), `Rect` (`Quat`), and `Transparency` (`0..1`, cascaded across all window layers, `.sanim` effects, and child windows).
 - **Layers (`TweenService:Layer(wnd, layerIdx)`)**: `Color` (ARGB), `Transparency` (`0..1`), `Left`, `Top`, `Width`, `Height`.
 - **Effects (`UI:GetEffectFromLayer(wnd, layerIdx)`)**: `Scale` (number or `Vec2`), `Position` (`Vec2`), `Alpha` (`0..255`), `Transparency` (`0..1`), `Color` (ARGB multiply tint), and `AnimTime`.
+- **Roblox Instances (`GuiObject`, `UIGradient`, `UIStroke`, etc.)**: `UDim2`, `UDim`, `Vector2`, `Color3`, `ColorSequence`, `NumberSequence`, `NumberRange`, `Transparency`, `BackgroundTransparency`, `GroupTransparency`.
 - **Controller Tables**: Any plain Lua table with numeric, ARGB `*Color`, or `{x, y}` fields and an optional `OnChanged(self)` callback (similar to Roblox `NumberValue` / `Color3Value` objects).
+
+### `RbxUI` Toolkit Overview (`ui_overhaul/rbxui.lua`)
+
+`rbxui.lua` brings a retained-mode, Roblox-inspired GUI hierarchy into Star Conflict's immediate-mode rendering engine. Instead of fighting `.sanim` object locators and stripped `.def` tables, modders can construct custom interfaces using familiar Roblox primitives:
+
+- **Roblox Instances & Hierarchy**:
+  - `Instance.new("ScreenGui")`, `Frame`, `CanvasGroup`, `TextLabel`, `TextButton`, `ImageLabel`, `ImageButton`, `ScrollingFrame`.
+  - Automatic layout engines: `UIListLayout` (horizontal/vertical, fill direction, padding, alignment), `UIGridLayout` (cell sizing, aspect ratio).
+  - Styling modifiers: `UICorner` (rounded corners), `UIStroke` (borders/outlines), `UIPadding` (inner margins), `UIScale`, `UISizeConstraint`, `UIAspectRatioConstraint`.
+- **Pure Lua Data Types**:
+  - `UDim`, `UDim2`, `Vector2`, `Rect`, `Color3`, `ColorSequence`, `NumberSequence`, `NumberRange`.
+- **Gradients, Color Ranges & Alpha Crossfades**:
+  - `UIGradient` supports multi-stop `ColorSequence` and `NumberSequence` transparency keypoints across frames, image textures, strokes, and text.
+  - `RbxUI.Crossfade(fromGui, toGui, duration, directionAngle, softness)` provides smooth uniform or directional alpha-gradient wipes between screens.
+- **Native Hitbox Bridging**:
+  - Every interactive button (`TextButton`, `ImageButton`) automatically binds to a lightweight, invisible native hitbox window (`UI.ButtonWnd`), ensuring native hover/press states and click events dispatch without blocking non-interactive areas.
+  - Wire button presses directly to native game functions with one line:
+    ```lua
+    playBtn.Activated:Connect(function()
+        UI.LoginWnd:StartLogin()
+    end)
+    ```
 
 > **Roadmap**: More Roblox-style UI utilities, layout helpers, and additional screen overhauls will follow as more of the engine's UI internals are mapped out and new UI features are ported in.
 
@@ -176,7 +217,11 @@ StarConflict_ServerSelector/
 ├── patcher.py                      # Standalone Python CLI installer / uninstaller
 ├── server_selector_mod.lua         # Complete Lua source for the Server Selector mod
 ├── assets/
-│   └── cinematic_intro.gif         # Recorded preview of the login boot sequence
+│   ├── quickplay_showcase.gif      # Full end-to-end showcase of boot sequence and Quick-Play
+│   ├── cinematic_intro.gif         # Recorded preview of the login boot sequence
+│   ├── quickplay_transition.gif    # Form minimize transition animation
+│   ├── quickplay_minimized.png     # Resting state screenshot
+│   └── quickplay_expanded.png      # Expanded form screenshot
 ├── ui_overhaul/                    # UI Overhaul mod (copied from SC_UIRenderer/mods, its dev source)
 │   ├── tweenservice.lua            #   Roblox-style TweenService animation library
 │   └── login_tween_demo.lua        #   Cinematic animated login screen
