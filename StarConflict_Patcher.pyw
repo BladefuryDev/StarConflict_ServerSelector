@@ -19,7 +19,7 @@ import webbrowser
 import tkinter as tk
 from tkinter import filedialog, messagebox
 
-APP_VERSION = "v1.2.1"
+APP_VERSION = "v1.2.2"
 GITHUB_REPO = "BladefuryDev/StarConflict_ServerSelector"
 GITHUB_RELEASES_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 GITHUB_PROJECT_URL = f"https://github.com/{GITHUB_REPO}"

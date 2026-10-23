@@ -144,21 +144,40 @@ do
 	local function isUserdataVec( v ) return type( v ) == "userdata" and v.x ~= nil end
 	local function lerpValue( a, b, t, isColor )
 		local ta = type( a )
+		local tb = type( b )
 		if ta == "table" and type( a.Lerp ) == "function" then return a:Lerp( b, t ) end
 		if isColor then return lerpColor( a, b, t ) end
-		if ta == "number" then return a + ( b - a ) * t end
-		if isUserdataVec( a ) or isUserdataVec( b ) or ( ta == "table" and a.x ~= nil ) then
-			local bx, by = b.x or b[ 1 ], b.y or b[ 2 ]
-			local x, y = a.x + ( bx - a.x ) * t, a.y + ( by - a.y ) * t
+		if ta == "number" and tb == "number" then return a + ( b - a ) * t end
+		if isUserdataVec( a ) or isUserdataVec( b ) or ( ta == "table" and a.x ~= nil ) or ( tb == "table" and b.x ~= nil ) or ( ta == "number" and isUserdataVec( b ) ) or ( tb == "number" and isUserdataVec( a ) ) then
+			local ax, ay
+			if ta == "number" then
+				ax, ay = a, a
+			elseif ta == "table" then
+				ax, ay = a.x or a[ 1 ] or 0, a.y or a[ 2 ] or 0
+			else
+				ax, ay = a.x or 0, a.y or 0
+			end
+
+			local bx, by
+			if tb == "number" then
+				bx, by = b, b
+			elseif tb == "table" then
+				bx, by = b.x or b[ 1 ] or 0, b.y or b[ 2 ] or 0
+			else
+				bx, by = b.x or 0, b.y or 0
+			end
+
+			local x, y = ax + ( bx - ax ) * t, ay + ( by - ay ) * t
 			local hasZ, az = pcall( function() return a.z end )
 			if hasZ and az ~= nil then
-				local bz = b.z or ( type( b ) == "table" and b[ 3 ] ) or 0
-				local bw = b.w or ( type( b ) == "table" and b[ 4 ] ) or 0
+				local bz = ( tb == "number" and b ) or ( tb == "table" and ( b.z or b[ 3 ] ) ) or ( isUserdataVec( b ) and b.z ) or 0
+				local bw = ( tb == "number" and b ) or ( tb == "table" and ( b.w or b[ 4 ] ) ) or ( isUserdataVec( b ) and b.w ) or 0
 				local okW, aw = pcall( function() return a.w end )
 				return UI:Quat( x, y, az + ( bz - az ) * t, ( okW and aw or 0 ) + ( bw - ( okW and aw or 0 ) ) * t )
 			end
 			return UI:Vec2( x, y )
 		end
+		if ta == "number" then return a + ( ( tonumber( b ) or a ) - a ) * t end
 		if ta == "table" then
 			local out = {}
 			for k, v in pairs( a ) do out[ k ] = v + ( ( b[ k ] or v ) - v ) * t end

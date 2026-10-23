@@ -22,3 +22,9 @@ saved_servers.cfg
 Thumbs.db
 .vscode/
 .idea/
+
+# AI / developer hand-over notes (kept locally, never published)
+HANDOFF.md
+handoff.md
+**/HANDOFF.md
+**/handoff.md

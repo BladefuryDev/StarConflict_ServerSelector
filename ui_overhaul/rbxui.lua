@@ -931,6 +931,13 @@ do
 			BorderSizePixel        = 0,
 			BorderMode             = Enum.BorderMode.Outline,
 			GuiState               = Enum.GuiState.Idle,
+			-- Transforms reach every descendant: Position (children are placed inside the parent),
+			-- UIScale, GroupTransparency and GroupColor3 (any GuiObject, not only CanvasGroup).
+			GroupTransparency      = 0,
+			-- true: this element ignores its ancestors' transforms (position, size, UIScale,
+			-- transparency, tint, clipping) and lays out against the ScreenGui, while staying in
+			-- the hierarchy for lifetime and Visible. For the rare element that must not follow.
+			IgnoreParentTransforms = false,
 		}, function( self )
 			local s = self._signals
 			s.MouseEnter         = Signal.new()
@@ -1331,14 +1338,17 @@ do
 				if auto == Enum.AutomaticSize.Y or auto == Enum.AutomaticSize.XY then h = max( h, th + 4 * sy ) end
 			end
 
+			-- Position puts the AnchorPoint in the parent, in the parent's scale; the element's own
+			-- UIScale then grows it around that point ((0.5, 0.5) = from the centre)
 			local x, y
 			if node._layoutOverridePos then
 				x, y = node._layoutOverridePos.X, node._layoutOverridePos.Y
 			else
 				local pos = p.Position
 				local ap  = p.AnchorPoint
-				x = parentX + pos.X.Scale * parentW + pos.X.Offset * sx - ap.X * w
-				y = parentY + pos.Y.Scale * parentH + pos.Y.Offset * sy - ap.Y * h
+				local inh = inheritedScale or 1
+				x = parentX + pos.X.Scale * parentW + pos.X.Offset * oxScale * inh - ap.X * w
+				y = parentY + pos.Y.Scale * parentH + pos.Y.Offset * oyScale * inh - ap.Y * h
 			end
 
 			p.AbsolutePosition = Vector2.new( x, y )
@@ -1359,16 +1369,23 @@ do
 				ch = canvasH
 			end
 
-			-- Gather visible GuiObject children
-			local guiChildren = {}
+			-- Gather visible GuiObject children (detached ones lay out against the ScreenGui)
+			local guiChildren, detached = {}, {}
 			for i, c in ipairs( node._children ) do
 				if c:IsA( "GuiObject" ) then
 					c._layoutOverridePos  = nil
 					c._layoutOverrideSize = nil
 					if c._props.Visible then
-						guiChildren[ #guiChildren + 1 ] = { node = c, idx = i }
+						if c._props.IgnoreParentTransforms then
+							detached[ #detached + 1 ] = c
+						else
+							guiChildren[ #guiChildren + 1 ] = { node = c, idx = i }
+						end
 					end
 				end
+			end
+			for _, c in ipairs( detached ) do
+				computeLayoutTree( c, 0, 0, 1024, 768, oxScale, oyScale, 1 )
 			end
 
 			local layout = mods.layout
@@ -1979,11 +1996,12 @@ do
 			local p = node._props
 			if not p.Visible then return end
 
-			if p.ClassName == "CanvasGroup" then
-				groupTint  = tintColor( p.GroupColor3, groupTint )
+			if p.IgnoreParentTransforms then groupTint, groupTrans, clip = nil, 0, nil end
+			if p.GroupColor3 then groupTint = tintColor( p.GroupColor3, groupTint ) end
+			if ( p.GroupTransparency or 0 ) > 0 then
 				groupTrans = combineTransparency( groupTrans, p.GroupTransparency )
-				if groupTrans >= 0.999 then return end
 			end
+			if groupTrans >= 0.999 then return end
 
 			drawNodeSelf( node, oxScale, oyScale, groupTint, groupTrans, clip )
 
@@ -2067,6 +2085,7 @@ do
 			local wndName = "RbxHit_" .. tostring( node._id )
 			if not UI[ wndName ] or not UI[ wndName ].w then
 				local tbl = {
+					__rbxInternal = true,
 					def = {
 						className = "ButtonWnd",
 						props = {
@@ -2117,6 +2136,16 @@ do
 						UserInputState = Enum.UserInputState.Begin,
 						Position       = Vector2.new( mx, my ),
 					} )
+					-- Clicking RbxUI takes focus off a native edit field. Focus moves to the
+					-- ScreenGui's host window (not to nothing), so Tab / Enter keep working there.
+					if UI.GetKeyboardFocus and UI.SetKeyboardFocus then
+						local focusedObj = UI.GetUiObjByHandleT and UI:GetUiObjByHandleT( UI:GetKeyboardFocus() )
+						local host = node._hitHost and node._hitHost:GetParent()
+						if focusedObj and type( focusedObj.GetEditText ) == "function" and host and host.w then
+							UI:SetKeyboardFocus( host:GetUiHandle() )
+							if host.ResetFocus then pcall( host.ResetFocus, host ) end
+						end
+					end
 					return true
 				end
 
@@ -2274,6 +2303,7 @@ do
 			local wndName = "RbxScreenGui_" .. tostring( sg._id )
 			if not UI[ wndName ] or not UI[ wndName ].w then
 				local tbl = {
+					__rbxInternal = true,
 					def = {
 						className = "Wnd",
 						props = {
@@ -2373,6 +2403,431 @@ do
 						sg._canvasWnd:UnlinkFromParent()
 					end
 				end
+			end
+		end
+	end
+
+	-- =========================================================================
+	-- 9b. Native Bridge: drive core-game windows (UI.Wnd) through RbxUI
+	-- =========================================================================
+	--   local play = RbxUI.Bridge( UI.Login_SteamLogInBtn )
+	--   play.Text = "Play"                 -- the window's TEXT layer ("^key" localizes)
+	--   play.GroupTransparency = 1         -- frame, effects, linked text, child windows: all of it
+	--   play.TextColor3 = Color3.fromRGB( 255, 210, 74 )
+	--   play.Position = UDim2.new( 0.5, 0, 1, -60 ); play.AnchorPoint = Vector2.new( 0.5, 1 )
+	--   play.Linked = true                 -- back to its .sanim locator (anchors per aspect ratio)
+	--   play.AnchorPoint = Vector2.new( 0.5, 0.5 )
+	--   TweenService:Create( play, info, { Scale = 1.05, Translation = Vector2.new( 0, -4 ) } ):Play()
+	--                                      -- grows from its centre and lifts; the locator keeps it
+	--                                      -- while transformed and gets it back at Scale 1 / Translation 0
+	--
+	-- Transforms reach everything the window contains: layers, effects, native child windows
+	-- and their bridges, unless a child sets IgnoreParentTransforms. TweenService tweens of
+	-- Transparency on any native window go through its bridge.
+	-- In game.exe a text layer linked to an effect object (COLOR / ALPHA links: every
+	-- EffectButtonWnd label) is re-coloured by the link each frame and ignores effect:SetAlpha
+	-- and SetColor, so a faded button kept its label. While faded or recoloured, the bridge
+	-- hides that layer and draws the same text itself (its font, rect, flags and link colour).
+	-- Edit fields are never redrawn (their text can be a password).
+	do
+		local Bridges  = setmetatable( {}, { __mode = "k" } )   -- native window table -> NativeFrame
+		local LinkInfo = {}                                       -- "UI.Name" -> locator link
+		RbxUI.Bridges  = Bridges
+
+		local function isWnd( t ) return type( t ) == "table" and t.w ~= nil and type( t.GetLeft ) == "function" end
+		local function alphaOf( c ) return floor( ( floor( c or 0 ) % 4294967296 ) / 16777216 ) end
+		local function withAlpha( c, a )
+			return floor( c or 0 ) % 16777216 + clamp( round( a ), 0, 255 ) * 16777216
+		end
+
+		-- Records the .sanim locator links of a host window's def (only readable at script
+		-- load: the engine clears .def once the window is built).
+		function RbxUI.CaptureLinks( host )
+			local def = type( host ) == "table" and rawget( host, "def" )
+			if type( def ) ~= "table" then return false end
+			for i, layer in ipairs( def.layers or {} ) do
+				for _, eff in ipairs( layer.effects or {} ) do
+					for _, l in ipairs( eff.links or {} ) do
+						if type( l.wnd ) == "string" then
+							LinkInfo[ l.wnd ] = { host = host, main = layer.main, layer = layer.id or ( i - 1 ),
+							                      objName = l.objName, params = l.animParams }
+						end
+					end
+				end
+			end
+			return true
+		end
+
+		local function linkFor( b )
+			if b._link ~= nil then return b._link or nil end
+			b._link = false
+			for name, info in pairs( LinkInfo ) do
+				local ok, t = pcall( UI.GetValByName, UI, name )
+				if ok and t == b._props.Native then b._link = info; break end
+			end
+			return b._link or nil
+		end
+
+		local function linkEffect( info )
+			local idx = ( info.main and info.host.layers and info.host.layers.MAIN_EFFECT ) or info.layer
+			return UI:GetEffectFromLayer( info.host, idx )
+		end
+
+		local function setLinked( b, linked )
+			local info, w = linkFor( b ), b._props.Native
+			local eff = info and linkEffect( info )
+			if not eff then return end
+			if linked then eff:LinkWnd( w:GetUiHandle(), info.objName, info.params )
+			else eff:UnlinkWnd( w:GetUiHandle(), "" ) end
+		end
+
+		local function parentBridge( b )
+			local p = b._props.Native:GetParent()
+			return p and Bridges[ p ]
+		end
+
+		local function effectiveTransparency( b )
+			local own = clamp( tonumber( b._props.GroupTransparency ) or 0, 0, 1 )
+			if b._props.IgnoreParentTransforms then return own end
+			local pb = parentBridge( b )
+			return pb and ( 1 - ( 1 - own ) * ( 1 - effectiveTransparency( pb ) ) ) or own
+		end
+
+		local function textIdx( b )
+			local w, idx = b._props.Native, b._props.TextLayer
+			if not idx then idx = w.layers and w.layers.TEXT end
+			if type( idx ) ~= "number" or idx >= ( w:GetNumLayers() or 0 ) then return nil end
+			return idx
+		end
+
+		local function nativeText( b )
+			local p, w = b._props, b._props.Native
+			local txt = ( p.Text ~= false and tostring( p.Text ) ) or ( w.GetText and w:GetText( b._textIdx ) ) or ""
+			if ssub( txt, 1, 1 ) == "^" and UI.GetStringByName then txt = UI:GetStringByName( ssub( txt, 2 ) ) or txt end
+			return txt
+		end
+
+		local function setNativeTextVisible( b, visible )
+			local w, idx = b._props.Native, b._textIdx
+			if not visible and not b._textHidden then
+				b._textWas = w:IsLayerVisible( idx )
+				b._textHidden = true
+				w:SetLayerVisible( false, idx )
+			elseif visible and b._textHidden then
+				b._textHidden = false
+				w:SetLayerVisible( b._textWas ~= false, idx )
+			end
+		end
+
+		local function drawProxyText( b, cx, cy, cw, ch )
+			local p, w, idx = b._props, b._props.Native, b._textIdx
+			if not b._textHidden or b._textWas == false or not _G.UI_DrawText then return end
+			local txt = nativeText( b )
+			if txt == "" then return end
+			local linkCol = w:GetColor( idx )   -- the link still pushes colour into the hidden layer
+			local alpha = alphaOf( linkCol ) * ( 1 - effectiveTransparency( b ) ) * ( 1 - clamp( tonumber( p.TextTransparency ) or 0, 0, 1 ) )
+			if alpha < 1 then return end
+			local rgb = p.TextColor3 and p.TextColor3:ToARGB( 0 ) or linkCol
+			local r = w:ToScreen( w:GetLayerRect( idx ) )
+			local rx, ry, rw, rh = r.x, r.y, r.z, r.w
+			if UI.drawer and UI.drawer.EndUiDrawing then UI.drawer:EndUiDrawing() end
+			_G.UI_DrawText( txt, w:GetFont( idx ), UI:Quat( rx, ry, rw, rh ), withAlpha( rgb, alpha ), 0,
+			                w:GetTextFormatFlags( idx ), UI:Quat( cx, cy, cw, ch ) )
+			if UI.drawer and UI.drawer.BeginUiDrawing then UI.drawer:BeginUiDrawing() end
+		end
+
+		local function syncProxyRect( b )
+			local w, pw = b._props.Native, b._proxy
+			local r = w:GetLayerRect( b._textIdx )
+			local x0, y0 = min( 0, r.x ), min( 0, r.y )
+			local x1, y1 = max( w:GetWidth(), r.x + r.z ), max( w:GetHeight(), r.y + r.w )
+			local pad = 16
+			pw:SetRect( UI:Quat( x0 - pad, y0 - pad, x1 - x0 + pad * 2, y1 - y0 + pad * 2 ) )
+		end
+
+		local function ensureProxy( b )
+			local w = b._props.Native
+			if not ( b._proxy and b._proxy.w ) then
+				local name = "RbxTextProxy_" .. tostring( b._id )
+				local tbl = {
+					__rbxInternal = true,
+					def = {
+						className = "Wnd",
+						props = {
+							name  = name,
+							style = ( UI.WS_NOT_MOUSE_REACT or 0 ) + ( UI.WS_NOT_KB_REACT or 0 ) + ( UI.WS_UPDATE_IF_VISIBLE or 0 ) + ( UI.WS_SKIP_OPEN or 0 ) + ( UI.WS_DISABLE_ONSHOW_EFFECT or 0 ) + ( UI.WS_DISABLE_ONHIDE_EFFECT or 0 ),
+						},
+						layers = {
+							{
+								layerType    = UI.LAYER_TEXT,
+								layerStyle   = ( UI.WLS_OWNERDRAW or 0 ) + ( UI.WLS_RESIZABLE or 0 ),
+								font         = { fontName = "Small" },
+								formatFlags  = ( FONT and FONT.TF_SINGLELINE or 0 ) + ( FONT and FONT.TF_NOCLIP or 0 ),
+								formatInfoSz = { 1, 1 },
+								color        = 0xFFFFFFFF,
+							},
+						},
+					},
+				}
+				tbl.F_OnNewFrame = function()
+					if b._textHidden and b._props.Native.w then
+						b._props.Native:SetLayerVisible( false, b._textIdx )   -- in case the window re-showed it
+						pcall( syncProxyRect, b )
+					end
+				end
+				tbl.F_DrawLayer = function( _, x0, y0, width, height, cx, cy, cw, ch, layerIdx )
+					if layerIdx ~= 0 then return end
+					local ok, err = pcall( drawProxyText, b, cx, cy, cw, ch )
+					if not ok and sys and sys.log then pcall( sys.log, "RbxUI: text proxy: " .. tostring( err ) ) end
+				end
+				UI[ name ] = tbl
+				local created = UI.CreateWndFromTable and UI:CreateWndFromTable( "UI." .. name )
+				if created then UI[ name ] = created end
+				local pw = UI[ name ]
+				if not pw or not pw.w then return nil end
+				pw.__rbxInternal = true
+				b._proxy = pw
+			end
+			if not b._proxy:IsChildOf( w ) then w:AddChild( b._proxy ) end
+			syncProxyRect( b )
+			return b._proxy
+		end
+
+		local function updateText( b, tr )
+			if not b._textIdx then return end
+			local p = b._props
+			if b._isEdit then
+				setNativeTextVisible( b, tr < 0.999 )
+				return
+			end
+			local want = tr > 0.001 or p.TextColor3 ~= false or ( tonumber( p.TextTransparency ) or 0 ) > 0
+			if want and nativeText( b ) ~= "" and ensureProxy( b ) then
+				setNativeTextVisible( b, false )
+			else
+				setNativeTextVisible( b, true )
+				if b._proxy and b._proxy.w and b._proxy:IsChildOf( b._props.Native ) then b._proxy:UnlinkFromParent() end
+			end
+		end
+
+		local function applyTransparency( b )
+			local w = b._props.Native
+			if not ( isWnd( w ) and w.w ) then return end
+			local tr = effectiveTransparency( b )
+			local proxied = b._textIdx and not b._isEdit
+			if tr > 0 or b._dirty then   -- untouched windows keep their own (game-driven) colours
+				local keep = 1 - tr
+				for i, a in pairs( b._base.layers ) do
+					if not ( proxied and i == b._textIdx ) then w:SetColor( withAlpha( w:GetColor( i ), a * keep ), i ) end
+				end
+				for i, a in pairs( b._base.effects ) do
+					local eff = UI:GetEffectFromLayer( w, i )
+					if eff then eff:SetAlpha( round( a * keep ) ) end
+				end
+				b._dirty = tr > 0
+			end
+			updateText( b, tr )
+			local c = w.GetFirstChild and w:GetFirstChild()
+			while c do
+				if not c.__rbxInternal then
+					local cb = Bridges[ c ] or ( tr > 0 and RbxUI.Bridge( c ) )
+					if cb then applyTransparency( cb ) end
+				end
+				c = c:GetNextSibling()
+			end
+		end
+
+		-- Geometry. Position places the AnchorPoint (Roblox). Scale and Translation are applied
+		-- around that same point, on top of wherever the window is: its Position / Size, or its
+		-- .sanim locator. A linked window is borrowed from its locator while Scale ~= 1 or
+		-- Translation ~= 0, and relinked once both are back to identity.
+		-- Effects scale about the window's top-left corner (the .sanim origin; that is why
+		-- the Play button grew to the right), so the window is moved to keep the pivot still.
+		local function rectOf( w ) return { w:GetLeft(), w:GetTop(), w:GetWidth(), w:GetHeight() } end
+
+		local function placedRect( b )   -- Position / Size result, before Scale and Translation
+			local p, w = b._props, b._props.Native
+			local x, y, width, height = b._rest[ 1 ], b._rest[ 2 ], b._rest[ 3 ], b._rest[ 4 ]
+			local parent = w:GetParent()
+			local pw, ph = 1024, 768
+			if parent then pw, ph = parent:GetWidth(), parent:GetHeight() end
+			local sx, sy = 1, 1
+			local ref = p.ReferenceResolution
+			if type( ref ) == "table" and ref.X and UI.XTo1024x768 then
+				local res = { x = ref.X, y = ref.Y }
+				sx, sy = UI:XTo1024x768( 1, res ), UI:YTo1024x768( 1, res )
+			end
+			if p.Size then
+				width  = p.Size.X.Scale * pw + p.Size.X.Offset * sx
+				height = p.Size.Y.Scale * ph + p.Size.Y.Offset * sy
+			end
+			if p.Position then
+				local ap = p.AnchorPoint
+				x = p.Position.X.Scale * pw + p.Position.X.Offset * sx - ap.X * width
+				y = p.Position.Y.Scale * ph + p.Position.Y.Offset * sy - ap.Y * height
+			end
+			return x, y, width, height
+		end
+
+		local function setEffectScale( w, s )
+			for i = 0, ( w:GetNumLayers() or 0 ) - 1 do
+				local eff = UI:GetEffectFromLayer( w, i )
+				if eff then eff:SetScale( UI:Vec2( s, s ) ) end
+			end
+		end
+
+		local function applyGeometry( b )
+			local p, w = b._props, b._props.Native
+			local s = tonumber( p.Scale ) or 1
+			local t = p.Translation
+			local tx, ty = ( t and t.X ) or 0, ( t and t.Y ) or 0
+			local x, y, width, height
+			if p.Linked then
+				if b._own then b._own = nil; b._rest = nil end
+				if s == 1 and tx == 0 and ty == 0 then
+					if b._borrowed then   -- back to identity: hand the window back to its locator
+						local r = b._borrowed
+						b._borrowed = nil
+						setEffectScale( w, 1 )
+						w:SetLeft( r[ 1 ] ); w:SetTop( r[ 2 ] ); w:SetWidth( r[ 3 ] ); w:SetHeight( r[ 4 ] )
+						setLinked( b, true )
+					end
+					return
+				end
+				if not b._borrowed then
+					b._borrowed = rectOf( w )
+					setLinked( b, false )
+				end
+				x, y, width, height = b._borrowed[ 1 ], b._borrowed[ 2 ], b._borrowed[ 3 ], b._borrowed[ 4 ]
+			else
+				if not b._own then   -- taking the window off its locator for good (until Linked = true)
+					b._own = true
+					b._rest = b._borrowed or rectOf( w )
+					b._borrowed = nil
+					setLinked( b, false )
+				end
+				x, y, width, height = placedRect( b )
+			end
+			local ap = p.AnchorPoint
+			setEffectScale( w, s )
+			w:SetWidth( width * s ); w:SetHeight( height * s )
+			w:SetLeft( x - ap.X * width * ( s - 1 ) + tx )
+			w:SetTop( y - ap.Y * height * ( s - 1 ) + ty )
+		end
+
+		local function updateAbsolute( b )
+			local r = b._props.Native:ToScreen( UI:Quat( 0, 0, b._props.Native:GetWidth(), b._props.Native:GetHeight() ) )
+			b._props.AbsolutePosition = Vector2.new( r.x, r.y )
+			b._props.AbsoluteSize     = Vector2.new( r.z, r.w )
+		end
+
+		local function onChanged( b, prop )
+			local p, w = b._props, b._props.Native
+			if not ( isWnd( w ) and w.w ) then return end
+			if prop == "GroupTransparency" or prop == "IgnoreParentTransforms" then
+				applyTransparency( b )
+			elseif prop == "Text" then
+				if p.Text ~= false and b._textIdx then w:SetText( tostring( p.Text ), b._textIdx ) end
+				updateText( b, effectiveTransparency( b ) )
+			elseif prop == "TextColor3" or prop == "TextTransparency" then
+				updateText( b, effectiveTransparency( b ) )
+			elseif prop == "Position" or prop == "Size" or prop == "ReferenceResolution" then
+				if p[ prop ] then p.Linked = false end   -- raw write: explicit placement leaves the locator
+				applyGeometry( b )
+				updateAbsolute( b )
+			elseif prop == "Linked" or prop == "AnchorPoint" or prop == "Scale" or prop == "Translation" then
+				applyGeometry( b )
+				updateAbsolute( b )
+			elseif prop == "Visible" then
+				local flags = ( UI.WS_NOT_DRAW or 0 ) + ( UI.WS_NOT_MOUSE_REACT or 0 )
+				if p.Visible then w:RemoveStyle( flags ) else w:AddStyle( flags ) end
+			end
+		end
+
+		registerClass( "NativeFrame", "GuiBase2d", {
+			Native                 = false,
+			GroupTransparency      = 0,
+			IgnoreParentTransforms = false,
+			Text                   = false,   -- false: leave the native text as the game sets it
+			TextColor3             = false,   -- false: the layer's own (link) colour
+			TextTransparency       = 0,
+			TextLayer              = false,   -- false: wnd.layers.TEXT
+			Position               = false,   -- UDim2 in the parent window; false: native placement
+			Size                   = false,   -- UDim2; false: native size
+			AnchorPoint            = function() return Vector2.new( 0, 0 ) end,   -- Position point and Scale pivot; (0.5, 0.5) = centre
+			ReferenceResolution    = false,   -- Vector2: offsets in that resolution's pixels (e.g. the .sanim base_res 1280x720)
+			Scale                  = 1,       -- size and effects, about AnchorPoint
+			Translation            = function() return Vector2.new( 0, 0 ) end,   -- Rel-unit shift on top of the placement
+			Linked                 = true,    -- placed by its .sanim locator
+			Visible                = true,
+		}, function( self )
+			self._signals.Changed:Connect( function( prop ) onChanged( self, prop ) end )
+		end )
+
+		function InstanceMethods:Refresh()   -- NativeFrame: re-apply everything (after the game reset the window)
+			if self.ClassName ~= "NativeFrame" then return end
+			onChanged( self, "Text" )
+			applyTransparency( self )
+			applyGeometry( self )
+			updateAbsolute( self )
+		end
+
+		-- NativeFrame: Scale 1, Translation 0 at once (a linked window goes back to its locator).
+		-- Cancel TweenService tweens on the bridge first if any are running.
+		function InstanceMethods:ResetTransform()
+			if self.ClassName ~= "NativeFrame" then return end
+			self._props.Scale = 1
+			self._props.Translation = Vector2.new( 0, 0 )
+			applyGeometry( self )
+			updateAbsolute( self )
+		end
+
+		-- One bridge per native window (weakly cached).
+		function RbxUI.Bridge( wnd )
+			if not isWnd( wnd ) then return nil end
+			local b = Bridges[ wnd ]
+			if b then return b end
+			b = Instance.new( "NativeFrame" )
+			b._props.Name   = ( wnd.GetName and wnd:GetName() ) or "NativeFrame"
+			b._props.Native = wnd
+			b._isEdit       = type( wnd.GetEditText ) == "function"
+			b._textIdx      = textIdx( b )
+			local base = { layers = {}, effects = {} }   -- alpha at rest; 0 is taken as "not captured yet"
+			for i = 0, ( wnd:GetNumLayers() or 0 ) - 1 do
+				local a = alphaOf( wnd:GetColor( i ) )
+				base.layers[ i ] = a > 0 and a or 255
+				local eff = UI:GetEffectFromLayer( wnd, i )
+				if eff then
+					local ea = eff:GetAlpha() or 255
+					base.effects[ i ] = ea > 0 and ea or 255
+				end
+			end
+			b._base = base
+			Bridges[ wnd ] = b
+			updateAbsolute( b )
+			return b
+		end
+
+		RbxUI.CaptureLinks( UI.LoginWnd )
+
+		-- TweenService: Transparency on any native window goes through its bridge
+		local TS = _G.TweenService
+		if TS and TS.Adapters and TS.AddAdapter then
+			local winAdapter
+			for _, a in ipairs( TS.Adapters ) do if a.name == "window" then winAdapter = a end end
+			if winAdapter then
+				local bridged = { Transparency = true, GroupTransparency = true }
+				TS:AddAdapter( {
+					name    = "native",
+					props   = setmetatable( { GroupTransparency = winAdapter.props.Transparency }, { __index = winAdapter.props } ),
+					accepts = function( t ) return isWnd( t ) and not t.__rbxInternal end,
+					get = function( w, p )
+						if bridged[ p ] then return RbxUI.Bridge( w ).GroupTransparency end
+						return winAdapter.get( w, p )
+					end,
+					set = function( w, p, v )
+						if bridged[ p ] then RbxUI.Bridge( w ).GroupTransparency = v else winAdapter.set( w, p, v ) end
+					end,
+				}, true )
 			end
 		end
 	end

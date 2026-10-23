@@ -42,6 +42,9 @@ do
 	                    "UI.Login_ServerPortEditWnd", "UI.NewsWnd" }
 	local TEXT_LAYERS = { LW.layers.BUILD_VERSION, LW.layers.WARNING, LW.layers.SERVER_STATUS,
 	                      LW.layers.STEAM_LOGIN_TIP, LW.layers.ARC_LOGIN_TIP }
+	local EDIT_FIELDS = { "Login_AccountEditWnd", "Login_PasswordEditWnd",
+	                      "Login_ServerNameEditWnd", "Login_ServerPortEditWnd",
+	                      "Login_TwoStepAuthorisation_KeyEditWnd" }
 
 	local GOLD, WHITE, BLACK = 0xFFFFD200, 0xFFFFFFFF, 0xFF000000
 	local COLOR_BIT      = UI.EffectAnimParams.COLOR
@@ -68,6 +71,93 @@ do
 	local function wndAny( name )
 		local ok, t = pcall( UI.GetValByName, UI, name )
 		return ( ok and t and t.w ) and t or nil
+	end
+
+	-- Calls the handler the window inherits from its prototype. The login windows get their
+	-- prototype (setmetatable, UI:InheritWnd) only when they are created, after this file has
+	-- run, so a hook installed here must not capture "prev = ew.F_..." (that is nil now) and
+	-- would otherwise replace the native EffectEditWnd focus handling outright.
+	local function protoCall( self, name, ... )
+		local mt = getmetatable( self )
+		local proto = mt and mt.__index
+		local f = type( proto ) == "table" and proto[ name ]
+		if type( f ) == "function" then return f( self, ... ) end
+	end
+
+	local function getEditFieldFromWnd( wnd )
+		if not wnd then return nil end
+		for _, key in ipairs( EDIT_FIELDS ) do
+			local ew = UI[ key ]
+			if ew and ew.w then
+				if wnd == ew or ( wnd.IsChildOf and wnd:IsChildOf( ew ) ) then
+					return ew
+				end
+			end
+		end
+		return nil
+	end
+
+	local function screenRect( w )   -- plain numbers: GetRect / ToScreen return ring-buffered Quats
+		local r = w:GetRect()
+		local p = w:GetParent()
+		if p then r = p:ToScreen( r ) end
+		return r.x, r.y, r.z, r.w
+	end
+
+	-- E-mail / Password plus the Server Selector's name / port fields, in Tab order
+	local TAB_ORDER = { "Login_AccountEditWnd", "Login_PasswordEditWnd",
+	                    "Login_ServerNameEditWnd", "Login_ServerPortEditWnd" }
+	local function visibleFields()
+		local out = {}
+		if demo.isMinimized then return out end
+		for _, key in ipairs( TAB_ORDER ) do
+			local ew = UI[ key ]
+			if ew and ew.w and ew:IsOnScreen() and ew:IsChildOf( LW ) then out[ #out + 1 ] = ew end
+		end
+		return out
+	end
+
+	local function editFieldAt( mx, my )
+		for _, ew in ipairs( visibleFields() ) do
+			local x, y, w, h = screenRect( ew )
+			if mx >= x and mx <= x + w and my >= y and my <= y + h then return ew end
+		end
+		return nil
+	end
+
+	local function refreshEditGlow()   -- the field frame plays "select" only while it has focus
+		for _, key in ipairs( EDIT_FIELDS ) do
+			local ew = UI[ key ]
+			if ew and ew.w and ew.UpdateMainAnimation then pcall( ew.UpdateMainAnimation, ew ) end
+		end
+	end
+
+	-- Takes keyboard focus off the fields but keeps it on the login window, so Tab and
+	-- Enter still reach LoginWnd:HandleKey (with no focus at all, keys go nowhere).
+	function demo.ParkFocus()
+		if getEditFieldFromWnd( UI:GetUiObjByHandleT( UI:GetKeyboardFocus() ) ) then
+			UI:SetKeyboardFocus( LW:GetUiHandle() )
+			LW:ResetFocus()
+		end
+	end
+
+	-- Tab / Shift+Tab: next / previous visible field (vanilla only toggles E-mail <-> Password)
+	function demo.FocusNextField( backwards )
+		local fields = visibleFields()
+		if #fields == 0 then return false end
+		local cur = UI:GetKeyboardFocus()
+		local at = 0
+		for i, ew in ipairs( fields ) do
+			if ew:GetUiHandle() == cur then at = i end
+		end
+		local step = backwards and -1 or 1
+		local nxt = ( at == 0 ) and ( backwards and #fields or 1 ) or ( ( at - 1 + step ) % #fields + 1 )
+		UI:SetKeyboardFocus( fields[ nxt ]:GetUiHandle() )
+		return true
+	end
+
+	local function shiftHeld()
+		return _G.Input_IsKeyPressed and UI.Keys.KEY_SHIFT and _G.Input_IsKeyPressed( UI.Keys.KEY_SHIFT ) or false
 	end
 
 	local function mainEffect() return UI:GetEffectFromLayer( LW, LW.layers.MAIN_EFFECT ) end
@@ -271,6 +361,155 @@ do
 	end
 
 	-- -------------------------------------------------------------------------
+	-- UI.Login_TypingCursor
+	-- Custom blinking typing cursor tied directly to keyboard focus
+	-- -------------------------------------------------------------------------
+	UI.Login_TypingCursor = {
+		def = {
+			className = "Wnd",
+			props = {
+				name  = "Login_TypingCursor",
+				style = UI.WS_NOT_MOUSE_REACT + UI.WS_NOT_KB_REACT + ( UI.WS_SKIP_OPEN or 0 ) + ( UI.WS_DISABLE_ONSHOW_EFFECT or 0 ) + ( UI.WS_DISABLE_ONHIDE_EFFECT or 0 ),
+			},
+			layers = {
+				{
+					layerType  = UI.LAYER_TEXTURE,
+					layerStyle = UI.WLS_RESIZABLE,
+					texture    = "white",
+					color      = 0xFFFFFFFF,
+				},
+			},
+		},
+		layers = {
+			BAR = 0,
+		},
+	}
+
+	local cursorState = {
+		wnd      = nil,
+		timer    = 0,
+		lastPos  = -1,
+		lastText = "",
+		visible  = false,
+	}
+	demo.cursorState = cursorState
+
+	local function ensureCustomCursor()
+		local cur = UI.Login_TypingCursor
+		if not cur or not cur.w or not cur.IsChildOf then
+			if UI.CreateWndFromTable then
+				local created = UI:CreateWndFromTable( "UI.Login_TypingCursor" )
+				if created then
+					UI.Login_TypingCursor = created
+					cur = created
+				end
+			end
+		end
+		if cur and cur.AddStyle then
+			pcall( function()
+				cur:AddStyle( UI.WS_NOT_MOUSE_REACT )
+				cur:AddStyle( UI.WS_NOT_KB_REACT )
+			end )
+		end
+		return cur
+	end
+
+	local function hideCustomCursor()
+		local cur = ensureCustomCursor()
+		if cur and cur.w then
+			TS:Set( cur, { Transparency = 1 } )
+			cur:SetLeft( -10000 )
+			cur:SetTop( -10000 )
+		end
+		cursorState.timer = 0
+		cursorState.visible = false
+	end
+
+	local function updateCustomCursor( dt )
+		local curFocus = UI.GetKeyboardFocus and UI:GetKeyboardFocus()
+		if not curFocus or curFocus == UI.INVALID_UI_HANDLE or demo.isMinimized then
+			hideCustomCursor()
+			return
+		end
+
+		local obj = UI.GetUiObjByHandleT and UI:GetUiObjByHandleT( curFocus )
+		local activeEw = getEditFieldFromWnd( obj )
+		if not activeEw or not activeEw.w or not activeEw:IsOnScreen() then
+			hideCustomCursor()
+			return
+		end
+
+		-- Keep the native caret hidden; ours replaces it (see the SetLayerVisible hook below)
+		if activeEw.layers and activeEw.layers.CURSOR then
+			pcall( function() activeEw:SetLayerVisible( false, activeEw.layers.CURSOR ) end )
+		end
+
+		-- While text is selected the caret is hidden, like the native one
+		local selStart = ( activeEw.GetSelStart and activeEw:GetSelStart() ) or -1
+		local selEnd = ( activeEw.GetSelEnd and activeEw:GetSelEnd() ) or -1
+		if selStart ~= -1 and selEnd ~= -1 and selStart ~= selEnd then
+			hideCustomCursor()
+			return
+		end
+
+		local curWnd = ensureCustomCursor()
+		if not curWnd or not curWnd.w then return end
+
+		if not curWnd:IsChildOf( LW ) then
+			LW:AddChild( curWnd )
+		end
+
+		local fx, fy, fw, fh = screenRect( activeEw )
+		local lw = LW:ToScreen( UI:Quat( 0, 0, 0, 0 ) )
+		local ox, oy = lw.x, lw.y
+
+		-- The engine keeps the CURSOR layer at the exact, pixel-snapped caret: after autoscroll,
+		-- in the font the .sanim link really draws with, over the password mask (decompiled
+		-- EditWnd, TYPING_AUDIT.md 1.2). Measuring the text ourselves put the bar inside the last glyph.
+		local caretX
+		if activeEw.layers and activeEw.layers.CURSOR then
+			local ok, x = pcall( function() return activeEw:ToScreen( activeEw:GetLayerRect( activeEw.layers.CURSOR ) ).x end )
+			if ok then caretX = x end
+		end
+		if not caretX then
+			local cpos = ( activeEw.GetCursorPos and activeEw:GetCursorPos() ) or 0   -- characters before the caret
+			local draw = ( activeEw.GetDrawText and activeEw:GetDrawText() ) or ""
+			caretX = fx + SX( 3.5 ) + measureTextW( string.sub( draw, 1, cpos ), safeFont( "Small" ) )
+		end
+
+		local curW = SX( 1.6 )
+		local curH = SY( 13 )
+		local curX = caretX + UI:XToRel( 1 )   -- one pixel clear of the last glyph's outline
+		local curY = fy + ( fh - curH ) * 0.5
+		curX = math.max( fx, math.min( curX, fx + fw - curW ) )
+
+		-- Restart the blink on every caret move or edit, so the bar stays solid while typing
+		local text = ( activeEw.GetEditText and activeEw:GetEditText() ) or ""
+		local cpos = activeEw.GetCursorPos and activeEw:GetCursorPos()
+		if cpos ~= cursorState.lastPos or text ~= cursorState.lastText or activeEw ~= cursorState.wnd then
+			cursorState.lastPos = cpos
+			cursorState.lastText = text
+			cursorState.wnd = activeEw
+			cursorState.timer = 0
+		else
+			cursorState.timer = cursorState.timer + ( dt or 0.033 )
+			if cursorState.timer >= 1.0 then
+				cursorState.timer = cursorState.timer - 1.0
+			end
+		end
+
+		local showBar = ( cursorState.timer < 0.53 )
+
+		curWnd:SetLeft( curX - ox )
+		curWnd:SetTop( curY - oy )
+		curWnd:SetWidth( curW )
+		curWnd:SetHeight( curH )
+
+		TS:Set( curWnd, { Transparency = showBar and 0 or 1 } )
+		cursorState.visible = showBar
+	end
+
+	-- -------------------------------------------------------------------------
 	-- Background Zoom & Color State
 	-- -------------------------------------------------------------------------
 	local function setBgState( s, col )
@@ -349,55 +588,38 @@ do
 	-- -------------------------------------------------------------------------
 	-- Hover Scale Hook (for SIDE buttons and UI.Login_SteamLogInBtn)
 	-- -------------------------------------------------------------------------
+	local function hoverBridge( w ) return RbxUI and RbxUI.Bridge and RbxUI.Bridge( w ) end
+
+	-- Ends a hover at once (Scale 1, no lift; the button goes back to its locator) before
+	-- other code moves the button itself.
+	local function resetHover( w )
+		local b = w and hoverBridge( w )
+		demo.hover[ w ] = nil
+		if b then TS:CancelAll( b ); b:ResetTransform() end
+	end
+	demo.ResetHover = resetHover
+
+	-- Hover grows the button from its centre (AnchorPoint 0.5, 0.5) and optionally lifts it.
+	-- RbxUI's bridge does the pivot maths: effects scale about the window's top-left corner,
+	-- which is why a plain effect Scale made the Play button grow towards the right.
 	local function hookHover( name, w, customScale, verticalLift )
 		if not w or w.__demoHover then return end
+		local b = hoverBridge( w )
+		if not b then return end
 		w.__demoHover = true
+		b.AnchorPoint = Vector2.new( 0.5, 0.5 )
 		local scaleTarget = customScale or HOVER_SCALE
 		local prev = w.UpdateEffectAnimation
 		w.UpdateEffectAnimation = function( self, ... )
 			if prev then prev( self, ... ) end
 			if not demo.played or not self.__demoReady then return end
-			local eff = UI:GetEffectFromLayer( self, self.layers.MAIN_EFFECT )
-			if not eff then return end
 			local over = self:GetMouseState() ~= UI.MOUSE_OUT
-			local h = demo.hover[ self ]
-			if over and ( not h or h.back ) then
-				if not h then
-					unlinkWnd( name, self )
-					h = { x = self:GetLeft(), y = self:GetTop(), w = self:GetWidth(), h = self:GetHeight() }
-					demo.hover[ self ] = h
-				else
-					if h.backPos then h.backPos:Cancel() end
-					if h.backScale then h.backScale:Cancel() end
-					h.back = nil
-				end
-				local dx = verticalLift and 0 or ( h.w * ( scaleTarget - 1 ) * 0.5 )
-				local dy = verticalLift or ( h.h * ( scaleTarget - 1 ) * 0.5 )
-				local info = TweenInfo.new( HOVER_TIME, "Quad", "Out" )
-				h.twPos   = TS:Create( self, info, { Left = h.x - dx, Top = h.y - dy } )
-				h.twScale = TS:Create( eff,  info, { Scale = scaleTarget } )
-				h.twPos:Play()
-				h.twScale:Play()
-			elseif not over and h and not h.back then
-				h.back = true
-				local info = TweenInfo.new( HOVER_TIME, "Quad", "Out" )
-				h.backPos   = TS:Create( self, info, { Left = h.x, Top = h.y } )
-				h.backScale = TS:Create( eff,  info, { Scale = 1 } )
-				h.backPos.Completed:Connect( function( state )
-					if state == "Completed" and demo.hover[ self ] == h then
-						demo.hover[ self ] = nil
-						TS:Set( eff, { Scale = 1 } )
-						relinkWnd( name, self )
-					end
-				end )
-				h.backPos:Play()
-				h.backScale:Play()
-			elseif not over and not h then
-				local curScale = eff:GetScale()
-				if curScale and ( math.abs( curScale.x - 1 ) > 0.01 or math.abs( curScale.y - 1 ) > 0.01 ) then
-					eff:SetScale( UI:Vec2( 1, 1 ) )
-				end
-			end
+			if over == ( demo.hover[ self ] == true ) then return end
+			demo.hover[ self ] = over or nil
+			local goal = over and { Scale = scaleTarget, Translation = Vector2.new( 0, -( verticalLift or 0 ) ) }
+			                   or { Scale = 1, Translation = Vector2.new( 0, 0 ) }
+			local tw = TS:Create( b, TweenInfo.new( HOVER_TIME, "Quad", "Out" ), goal )
+			if tw then tw:Play() end
 		end
 	end
 
@@ -478,9 +700,7 @@ do
 		local wb = ensureWelcomeBar()
 		if show then
 			if playBtn and playBtn.w then
-				demo.hover[ playBtn ] = nil
-				local eff = UI:GetEffectFromLayer( playBtn, playBtn.layers.MAIN_EFFECT )
-				if eff then TS:Set( eff, { Scale = 1 } ) end
+				resetHover( playBtn )
 				LW:AddControl( playBtn, LW.layers.MAIN_EFFECT, LW.effectInfo.main.steamLogInBtnLocator )
 				playBtn:SetText( "Play", playBtn.layers.TEXT )
 				playBtn:Enable( LW.waitMode == LW.waitModes.NONE )
@@ -495,9 +715,7 @@ do
 			end
 		else
 			if playBtn and playBtn.w then
-				demo.hover[ playBtn ] = nil
-				local eff = UI:GetEffectFromLayer( playBtn, playBtn.layers.MAIN_EFFECT )
-				if eff then TS:Set( eff, { Scale = 1 } ) end
+				resetHover( playBtn )
 				playBtn:SetText( "^login_btnLogin", playBtn.layers.TEXT )
 				LW:RemoveControl( playBtn, LW.layers.MAIN_EFFECT )
 			end
@@ -523,7 +741,7 @@ do
 		cancelAuthTweens()
 		demo.isMinimized     = true
 		demo.pendingMinimize = false
-		LW:ResetFocus()
+		demo.ParkFocus()   -- the fields are about to hide; typing must not go into them
 
 		local playBtn = UI.Login_SteamLogInBtn
 		local wb      = ensureWelcomeBar()
@@ -631,7 +849,7 @@ do
 		-- 1. Slide up & fade out the Golden Play Button and Welcome Bar
 		if playBtn and playBtn.w and playBtn:IsChildOf( LW ) then
 			playBtn.__demoReady = false
-			demo.hover[ playBtn ] = nil
+			resetHover( playBtn )
 			unlinkWnd( "UI.Login_SteamLogInBtn", playBtn )
 			local by = playBtn:GetTop()
 			local hidePlay = trackAuth( TS:Create( playBtn, TweenInfo.new( 0.18, "Quad", "In" ), { Top = by - SY( 18 ), Transparency = 1 } ) )
@@ -681,10 +899,15 @@ do
 			end
 		end
 
+		local targetEw = nil
 		if focusPassword and UI.Login_PasswordEditWnd and UI.Login_PasswordEditWnd.w then
-			UI:SetKeyboardFocus( UI.Login_PasswordEditWnd:GetUiHandle() )
+			targetEw = UI.Login_PasswordEditWnd
 		elseif UI.Login_AccountEditWnd and UI.Login_AccountEditWnd.w then
-			UI:SetKeyboardFocus( UI.Login_AccountEditWnd:GetUiHandle() )
+			targetEw = UI.Login_AccountEditWnd
+		end
+
+		if targetEw then
+			UI:SetKeyboardFocus( targetEw:GetUiHandle() )   -- native focus selects the text
 		else
 			LW:UpdateFocus()
 		end
@@ -756,10 +979,9 @@ do
 				unlinkWnd( "UI.Login_SteamLogInBtn", playBtn )
 				playBtn:SetText( "Play", playBtn.layers.TEXT )
 
+				-- Transparency goes through RbxUI's native bridge, which also fades the
+				-- link-coloured "Play" label (the engine ignores alpha on that layer)
 				TS:Set( playBtn, { Left = bx, Top = by - SY( 26 ), Transparency = 1 } )
-				local eff = UI:GetEffectFromLayer( playBtn, playBtn.layers.MAIN_EFFECT )
-				if eff then eff:SetAlpha( 0 ) end
-				playBtn:SetColor( 0x00FFFFFF, playBtn.layers.TEXT )
 
 				-- Entrance staggered alongside menu items, dropping in last
 				local d = UI_START_DELAY + 0.48
@@ -856,9 +1078,8 @@ do
 			local w = wndByName( name )
 			if w then
 				w.__demoReady = true
+				resetHover( w )
 				TS:CancelAll( w )
-				local eff = UI:GetEffectFromLayer( w, w.layers.MAIN_EFFECT )
-				if eff then TS:CancelAll( eff ); TS:Set( eff, { Scale = 1 } ) end
 				TS:Set( w, { Transparency = 0 } )
 				relinkWnd( name, w )
 			end
@@ -870,9 +1091,8 @@ do
 			local playBtn = UI.Login_SteamLogInBtn
 			if playBtn and playBtn.w then
 				playBtn.__demoReady = true
+				resetHover( playBtn )
 				TS:CancelAll( playBtn )
-				local eff = UI:GetEffectFromLayer( playBtn, playBtn.layers.MAIN_EFFECT )
-				if eff then TS:CancelAll( eff ); TS:Set( eff, { Scale = 1 } ) end
 				TS:Set( playBtn, { Transparency = 0 } )
 				relinkWnd( "UI.Login_SteamLogInBtn", playBtn )
 				playBtn:SetText( "Play", playBtn.layers.TEXT )
@@ -994,6 +1214,30 @@ do
 		if prevOnLogIn then return prevOnLogIn( self, ... ) end
 	end
 
+	-- Typing is left to the engine (TYPING_AUDIT.md): the native EffectEditWnd handlers select
+	-- the text on focus, clear it on blur and place the caret on a second click. The hooks below
+	-- only add click-away, Tab order and Quick-Play, and always run the inherited handler.
+
+	-- A focused field reports every mouse-down (EV_MOUSE_BUTTON_DOWN); vanilla answers a miss
+	-- with ResetFocus. When the click landed outside every field, also take focus off the field.
+	local prevOnEditMiss = LW.OnEditMissMouse
+	LW.OnEditMissMouse = function( self, editWnd, ... )
+		local res
+		if prevOnEditMiss then res = prevOnEditMiss( self, editWnd, ... ) end
+		local mx, my = UI:GetMouseX(), UI:GetMouseY()
+		if not editFieldAt( mx, my ) then demo.ParkFocus() end
+		return res
+	end
+
+	local prevOnTab = LW.OnTab
+	LW.OnTab = function( self, ... )
+		if self.waitMode == self.waitModes.NONE then
+			if demo.isMinimized then return true end   -- the fields are hidden in Quick-Play
+			if demo.FocusNextField( shiftHeld() ) then return true end
+		end
+		if prevOnTab then return prevOnTab( self, ... ) end
+	end
+
 	local prevLButtonDown = LW.F_OnMouseLButtonDown
 	LW.F_OnMouseLButtonDown = function( self, mouseX, mouseY, wndThatReceivedInput )
 		local wnd = UI:GetUiObjByHandleT( wndThatReceivedInput )
@@ -1005,23 +1249,44 @@ do
 		return false
 	end
 
-	-- If user checked "Remember me" before typing their username, auto-minimize once
-	-- they finish typing and leave the edit box
-	for _, editKey in ipairs( { "Login_AccountEditWnd", "Login_PasswordEditWnd" } ) do
+	for _, editKey in ipairs( EDIT_FIELDS ) do
 		local ew = UI[ editKey ]
 		if ew then
-			local prevLost = ew.F_OnLostKeyboardFocus
 			ew.F_OnLostKeyboardFocus = function( self, ... )
-				if prevLost then prevLost( self, ... ) end
-				if demo.pendingMinimize and not demo.isMinimized then
-					local acc = currentUsername()
-					local pass = ( UI.Login_PasswordEditWnd and UI.Login_PasswordEditWnd.GetEditText and UI.Login_PasswordEditWnd:GetEditText() ) or ""
-					if acc ~= "" and pass ~= "" then
-						LW:SaveAuthorizationData()
-						demo.MinimizeToPlayBtn( true )
-					end
-				end
+				local res = protoCall( self, "F_OnLostKeyboardFocus", ... )
+				if demo.pendingMinimize then demo.minimizeCheck = true end   -- decided next frame
+				return res
 			end
+
+			-- Tab is handled here rather than relying on the key bubbling up to LoginWnd
+			ew.F_OnKeyboardKeyDown = function( self, key, wndThatReceivedInput )
+				if key == UI.Keys.KEY_TAB and getEditFieldFromWnd( self ) and LW:IsOnScreen()
+				   and LW.waitMode == LW.waitModes.NONE and demo.FocusNextField( shiftHeld() ) then
+					return true
+				end
+				return protoCall( self, "F_OnKeyboardKeyDown", key, wndThatReceivedInput )
+			end
+
+			-- CursorTwinkle (effecteditwnd.lua) re-shows the native caret on every loop and every
+			-- keystroke; on the login fields the custom caret replaces it, so keep it hidden.
+			ew.SetLayerVisible = function( self, bVisible, layerIdx, ... )
+				if self.layers and layerIdx == self.layers.CURSOR then bVisible = false end
+				return protoCall( self, "SetLayerVisible", bVisible, layerIdx, ... )
+			end
+		end
+	end
+
+	-- Remember-me ticked before the form was filled: minimize once focus has left the form
+	-- with both fields filled (not on every field switch, which collapsed the form mid-edit).
+	local function checkPendingMinimize()
+		if not demo.minimizeCheck then return end
+		demo.minimizeCheck = false
+		if not demo.pendingMinimize or demo.isMinimized then return end
+		if getEditFieldFromWnd( UI:GetUiObjByHandleT( UI:GetKeyboardFocus() ) ) then return end
+		local pass = ( UI.Login_PasswordEditWnd and UI.Login_PasswordEditWnd:GetEditText() ) or ""
+		if currentUsername() ~= "" and pass ~= "" then
+			LW:SaveAuthorizationData()
+			demo.MinimizeToPlayBtn( true )
 		end
 	end
 
@@ -1067,6 +1332,17 @@ do
 				if wb.hoverTween then wb.hoverTween:Play() end
 			end
 		end
+
+		-- Focus changed (click, Tab, park): settle the field frames' select / deselect glow
+		local focus = UI:GetKeyboardFocus()
+		if focus ~= demo.lastFocus then
+			demo.lastFocus = focus
+			refreshEditGlow()
+		end
+		checkPendingMinimize()
+
+		-- Drive custom blinking typing cursor tied directly to keyboard focus
+		updateCustomCursor( dt_sys )
 	end
 
 	-- Sync owner-drawn warningMetaText ("Retrieving server list") with the WARNING layer's alpha
@@ -1083,6 +1359,7 @@ do
 	-- Replay next time the login screen opens
 	local prevHide = LW.F_OnAfterHideFromScreen
 	LW.F_OnAfterHideFromScreen = function( self, ... )
+		hideCustomCursor()
 		if demo.played then pcall( demo.SnapToLinks ) end
 		demo.played = false
 		if prevHide then return prevHide( self, ... ) end
